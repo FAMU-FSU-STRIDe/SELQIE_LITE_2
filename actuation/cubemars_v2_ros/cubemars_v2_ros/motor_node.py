@@ -144,8 +144,8 @@ class MotorNode(Node):
         self.declare_parameter("gear_ratio", 0.0)
         self.declare_parameter("cmd_timeout", 0.5)  # seconds before a stale cmd is cleared
         # POSITION-mode streaming. Selectable at runtime via the special commands
-        # "pos" / "pos_spd" (the UI sets pos_spd for slow gaits (<1 Hz) and
-        # stand/ready holds, and pos for faster gaits).
+        # "pos" / "pos_spd" (the UI sets pos for all gaits and pos_spd for the
+        # stand/ready hold).
         #  "pos_spd" (default): SET_POS_SPD with a trajectory-derived speed
         #            feed-forward. Smooth, and the right choice for the gentle
         #            stand/ready move and slow gaits. Its acceleration field is
@@ -419,8 +419,8 @@ class MotorNode(Node):
 
         if m in ("pos", "pos_spd"):
             # Switch the POSITION streaming submode at runtime. The UI selects
-            # pos_spd (smooth) for slow gaits (<1 Hz) and stand/ready holds, and
-            # pos (accurate) for faster gaits.
+            # pos (accurate) for all gaits and pos_spd (smooth) for the
+            # stand/ready hold.
             if m != self.position_mode:
                 with self._lock:
                     self.position_mode = m

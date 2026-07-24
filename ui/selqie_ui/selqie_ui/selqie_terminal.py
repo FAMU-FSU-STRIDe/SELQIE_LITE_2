@@ -127,10 +127,6 @@ class SELQIETerminal(Cmd):
         except ValueError:
             print("Invalid force values")
 
-    # Gaits at or above this frequency use plain position (SET_POS) for accuracy;
-    # slower gaits use the smooth position-speed submode.
-    POS_SPD_MAX_HZ = 1.0
-
     def do_run_trajectory(self, line : str):
         """ Run a trajectory file or sequence of files """
         args = line.split()
@@ -138,19 +134,17 @@ class SELQIETerminal(Cmd):
             print("Usage: run_trajectory <file1> <num_loops1> <frequency1> <file2> <num_loops2> <frequency2> ...")
             return
         try:
+            # Gaits run in plain position (SET_POS) for accurate tracking at any
+            # frequency; only the stand/ready hold uses the position-speed submode.
+            self._selqie.set_all_motors_position_mode('pos')
+            time.sleep(0.05)  # let the mode change take effect before streaming
             for seg in range(0, len(args), 3):
                 file = args[seg]
                 num_loops = int(args[seg+1])
                 frequency = float(args[seg+2])
-                # Slow gaits (<1 Hz) stay in the smooth position-speed submode;
-                # faster gaits switch to plain position so accuracy is not lost to
-                # the SET_POS_SPD acceleration ceiling.
-                mode = 'pos_spd' if frequency < self.POS_SPD_MAX_HZ else 'pos'
-                self._selqie.set_all_motors_position_mode(mode)
-                time.sleep(0.05)  # let the mode change take effect before streaming
                 rate = self._selqie.create_rate(frequency)
                 trajectories = self._selqie.get_leg_trajectories_from_file(file, frequency)
-                print(f"Running trajectory for {num_loops} loops at {frequency} Hz ({mode})")
+                print(f"Running trajectory for {num_loops} loops at {frequency} Hz")
                 for loop_idx in range(num_loops):
                     print(f"  Loop {loop_idx+1}/{num_loops}")
                     self._selqie.run_leg_trajectories(trajectories)
