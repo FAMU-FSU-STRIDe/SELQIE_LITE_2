@@ -1,4 +1,5 @@
 import os
+import bisect
 import math
 import time
 from threading import Thread, Event, Lock
@@ -12,7 +13,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 
 from std_msgs.msg import Bool, Empty, Float32, String, UInt32MultiArray
-from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped, Quaternion
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped, Quaternion, Vector3
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, Imu
 from actuation_msgs.msg import MotorCommand
@@ -56,6 +57,94 @@ def EUL2QUAT(eul) -> Quaternion:
     q.y = sy * cp * sr + cy * sp * cr
     q.z = sy * cp * cr - cy * sp * sr
     return q
+
+def _lerp_vector3(a: Vector3, b: Vector3, frac: float) -> Vector3:
+    """Linearly interpolate between two Vector3 messages."""
+    v = Vector3()
+    v.x = a.x + (b.x - a.x) * frac
+    v.y = a.y + (b.y - a.y) * frac
+    v.z = a.z + (b.z - a.z) * frac
+    return v
+
+def _lerp_leg_command(a: 'LegCommand', b: 'LegCommand', frac: float) -> 'LegCommand':
+    """Linearly interpolate two LegCommands. `control_mode` is categorical, so it
+    is held from `a` rather than blended."""
+    msg = LegCommand()
+    msg.control_mode = a.control_mode
+    msg.pos_setpoint = _lerp_vector3(a.pos_setpoint, b.pos_setpoint, frac)
+    msg.vel_setpoint = _lerp_vector3(a.vel_setpoint, b.vel_setpoint, frac)
+    msg.force_setpoint = _lerp_vector3(a.force_setpoint, b.force_setpoint, frac)
+    return msg
+
+def resample_leg_trajectory(times: list[float], commands: list['LegCommand'], resample_hz: float):
+    """Resample one leg's trajectory to a constant setpoint rate.
+
+    A trajectory file stores a gait cycle as fixed timestamped setpoints (e.g.
+    500 points/leg). Replaying those exact points after compressing the cycle
+    to run at a higher frequency makes the required setpoint rate scale with
+    frequency (rate = file_points * frequency), which can exceed what the CAN
+    bus / motor nodes can carry -- at 5x on a 500-point/1s file that is 2500
+    setpoints/s, well past the ~1500/s a 1 Mbps bus with 4 motors can sustain.
+
+    Instead, this linearly interpolates the trajectory and resamples it to a
+    constant ``resample_hz`` rate regardless of the original file's frequency.
+    This bounds the delivered rate at *every* run frequency: fewer, evenly
+    spaced points per cycle at high frequency, denser at low frequency -- so
+    nothing is unevenly dropped or the stride cut short by the transport
+    layer, and no single frequency is a bandwidth cliff.
+
+    ``times`` must be sorted ascending (they are the already frequency-scaled
+    per-cycle timestamps, i.e. what the caller would have used directly before
+    resampling existed). Spacing does not need to be uniform -- the trajectory
+    files are not perfectly uniform in practice (a few carry one slightly wider
+    trailing interval), so this looks up the true bracketing samples for each
+    new time rather than assuming a fixed step.
+
+    The cycle is assumed to loop smoothly: motion just after the last sample
+    continues into the first sample of the next repetition, one average
+    original sample-step later. That closing gap is filled by blending the
+    last sample toward the first. Returns ``(new_times, new_commands)``.
+    """
+    n = len(times)
+    if n == 0:
+        return [], []
+    if n == 1 or resample_hz <= 0.0:
+        return list(times), list(commands)
+
+    t_start = times[0]
+    t_end = times[-1]
+    avg_step = (t_end - t_start) / (n - 1)
+    period = (t_end - t_start) + avg_step  # includes the wrap-around gap
+
+    step = 1.0 / resample_hz
+    num_new = max(1, int(math.ceil(period / step)))
+
+    new_times = []
+    new_commands = []
+    for k in range(num_new):
+        t = k * step
+        if t >= period:
+            break
+        t_abs = t_start + t
+
+        if t_abs <= t_end:
+            # Find the bracketing original samples [i0, i1] via binary search;
+            # spacing need not be uniform.
+            i1 = bisect.bisect_right(times, t_abs)
+            i1 = min(max(i1, 1), n - 1)
+            i0 = i1 - 1
+            span = times[i1] - times[i0]
+            frac = 0.0 if span <= 0.0 else (t_abs - times[i0]) / span
+        else:
+            # Past the last real sample: blend toward the (identical) first
+            # sample of the next cycle to close the loop smoothly.
+            i0, i1 = n - 1, 0
+            frac = 0.0 if avg_step <= 0.0 else (t_abs - t_end) / avg_step
+
+        new_times.append(t_abs)
+        new_commands.append(_lerp_leg_command(commands[i0], commands[i1], frac))
+
+    return new_times, new_commands
 
 class SELQIE(Node):
     """The main class for the SELQIE robot ROS2 interface."""
@@ -120,6 +209,13 @@ class SELQIE(Node):
         self.NUM_LEGS = len(self.LEG_NAMES)
         self.DEFAULT_LEG_POSITION = [0.0, 0.0, -0.18914]
         self.TRAJECTORIES_FOLDER = os.path.join(get_package_share_directory('leg_trajectory_publisher'), 'trajectories')
+        # Trajectory files loaded via get_leg_trajectories_from_file are resampled
+        # to this constant setpoint rate (Hz), independent of the run frequency
+        # (see resample_leg_trajectory). Keep this <= the cubemars motor nodes'
+        # control_hz launch parameter, since a higher resample rate than the
+        # motor node consumes buys nothing -- the node just samples its latest
+        # cached command each control tick.
+        self.TRAJECTORY_RESAMPLE_HZ = 1000.0
 
         self._leg_command_publishers = []
         for i in range(self.NUM_LEGS):
@@ -394,18 +490,30 @@ class SELQIE(Node):
         self._leg_trajectory_publishers[leg_idx].publish(trajectory)
     
     def get_leg_trajectories_from_file(self, rel_file : str, frequency : float) -> list[LegTrajectory]:
-        """Get a list of LegTrajectory messages from a file."""
+        """Get a list of LegTrajectory messages from a file.
+
+        The file's per-cycle setpoints are frequency-scaled and then resampled
+        to a constant ``TRAJECTORY_RESAMPLE_HZ`` rate (see
+        ``resample_leg_trajectory``), so the delivered setpoint rate stays
+        bounded at any run frequency instead of scaling with it.
+        """
         file = os.path.join(self.TRAJECTORIES_FOLDER, rel_file)
         if not os.path.exists(file):
             raise FileNotFoundError(f'File {file} does not exist')
-        leg_trajectories = [LegTrajectory() for _ in range(self.NUM_LEGS)]
+        if frequency <= 0.0:
+            raise ValueError(f'frequency must be positive, got {frequency}')
+
+        raw_times = [[] for _ in range(self.NUM_LEGS)]
+        raw_commands = [[] for _ in range(self.NUM_LEGS)]
         with open(file) as f:
             for line in f:
                 parts = line.split()
                 if len(parts) != 13:
                     raise ValueError(f'Invalid file line: {line}')
-                time = float(parts[0]) / 1000.0 / frequency
                 leg_id = int(parts[1])
+                if (leg_id >= self.NUM_LEGS) or (leg_id < 0):
+                    raise ValueError(f'Expected leg ids between 0 and {self.NUM_LEGS - 1}')
+                time = float(parts[0]) / 1000.0 / frequency
                 msg = LegCommand()
                 msg.control_mode = int(parts[2])
                 msg.pos_setpoint.x = float(parts[4])
@@ -417,10 +525,15 @@ class SELQIE(Node):
                 msg.force_setpoint.x = float(parts[10])
                 msg.force_setpoint.y = float(parts[11])
                 msg.force_setpoint.z = float(parts[12])
-                if (leg_id > self.NUM_LEGS) or (leg_id < 0):
-                    raise ValueError(f'Expected leg ids between 0 and {self.NUM_LEGS - 1}')
-                leg_trajectories[leg_id].timing.append(time)
-                leg_trajectories[leg_id].commands.append(msg)
+                raw_times[leg_id].append(time)
+                raw_commands[leg_id].append(msg)
+
+        leg_trajectories = [LegTrajectory() for _ in range(self.NUM_LEGS)]
+        for leg_id in range(self.NUM_LEGS):
+            new_times, new_commands = resample_leg_trajectory(
+                raw_times[leg_id], raw_commands[leg_id], self.TRAJECTORY_RESAMPLE_HZ)
+            leg_trajectories[leg_id].timing = new_times
+            leg_trajectories[leg_id].commands = new_commands
         return leg_trajectories
     
     def run_leg_trajectories(self, trajectories : list[LegTrajectory]):
