@@ -57,7 +57,7 @@ the stand/ready hold.**
 * **`pos` — plain `SET_POS`.** The driver drives to each streamed setpoint using the motor's **full
   physical acceleration**, so it tracks position accurately at *every* gait frequency — used for all
   gaits. It is not acceleration-shaped, so a *coarse* setpoint stream would move as a slam-and-wait
-  staircase and can ring; the node streams finely at a high `control_hz` (default **500 Hz**) so the
+  staircase and can ring; the node streams finely at a high `control_hz` (default **1000 Hz**) so the
   position steps are small and the motion stays smooth.
 
 * **`pos_spd` — `SET_POS_SPD` (§5.1.7)** with a velocity feed-forward derived from the change in
@@ -72,10 +72,15 @@ the stand/ready hold.**
   (`pos_spd_min_speed`, rad/s) floors the commanded speed, letting held poses and the first move
   still reach their target. It only binds when the trajectory is (near-)stationary.
 
-**Why `control_hz` matters.** The leg stack streams setpoints at 500–1000 Hz (the trajectory point
-rate × frequency). The motor node samples the latest setpoint at `control_hz`; too low a rate both
-coarsens the motion (staircase → ring) and discards trajectory detail. 500 Hz captures the trajectory
-detail and stays within the 1 Mbps CAN budget (4 motors per bus, ~50% bus load with status feedback).
+**Why `control_hz` matters.** `run_trajectory` resamples gait files to a constant
+`TRAJECTORY_RESAMPLE_HZ` (default 1000 Hz, see `selqie_python.selqie`) regardless of the run
+frequency, so the setpoint stream rate is bounded at any frequency rather than scaling with it — see
+"`run_trajectory` and setpoint resampling" below. The motor node samples the latest setpoint at
+`control_hz`; it should match (or exceed) `TRAJECTORY_RESAMPLE_HZ`, since a lower rate would just
+undersample the resampled stream and reintroduce the staircase/ring problem. Default is **1000 Hz**
+on both sides. CAN load at 1000 Hz TX + up to 500 Hz status feedback (the driver's upload-rate cap,
+§5.2.1) is ~78% of a 1 Mbps bus with 4 motors — within budget but tighter than the previous 500 Hz
+default (~54%); watch bus utilization if you add motors per bus or raise the status upload rate.
 
 > **Notation trap:** servo **position** is output-shaft referenced, but servo **speed** is
 > *rotor-electrical* (ERPM). That asymmetry is why velocity conversion carries a `gear × pole_pairs`
@@ -90,6 +95,42 @@ detail and stays within the 1 Mbps CAN budget (4 motors per bus, ~50% bus load w
 | current | int16 | ×0.01 → A | `torque = I × Kt × gear` (N·m) |
 | temperature | int8 | °C | °C |
 | error | uint8 | — | 0–7 fault code |
+
+---
+
+## `run_trajectory` and setpoint resampling
+
+Gait trajectory files (`leg_trajectory_publisher/trajectories/*.txt`) store one cycle as fixed
+timestamped setpoints — e.g. 500 points/leg over a 1 s base. Running a file at frequency `f`
+compresses that cycle to `duration/f` seconds. Naively replaying the file's original points in that
+compressed window makes the required setpoint rate scale directly with `f`
+(`rate = file_points × f`): at 5× on a 500-point/1 s file that's 2500 setpoints/s/motor, well past
+what a 1 Mbps CAN bus with 4 motors can sustain (~1500/s/motor is a realistic ceiling) — the excess
+either gets dropped unevenly or truncates the stride before it finishes.
+
+`SELQIE.get_leg_trajectories_from_file` (in `selqie_python.selqie`) avoids this by **resampling**
+each leg's cycle to a constant setpoint rate, `TRAJECTORY_RESAMPLE_HZ` (default **1000 Hz**),
+independent of `f`. The cycle is linearly interpolated and re-sampled evenly, so the delivered rate
+is bounded at *every* run frequency:
+
+| `f` | resampled points/cycle (1000 Hz, 500-point/1 s file) |
+|---|---|
+| 1 | ~1000 (denser than the source file) |
+| 2 | ~500 (matches the source file) |
+| 5 | ~200 |
+
+Nothing is unevenly dropped or the stride cut short — every frequency gets a complete, evenly-spaced
+cycle, just at a resolution that trades off against frequency instead of exceeding the transport's
+bandwidth. This also incidentally smooths low-frequency gaits, since they're now *upsampled* (denser
+than the original file) rather than replayed at the file's native sparse spacing.
+
+`TRAJECTORY_RESAMPLE_HZ` should be kept **≤ the motor nodes' `control_hz`** — resampling faster than
+the motor node consumes buys nothing, since the node just samples its latest cached command each
+control tick. Both default to 1000 Hz.
+
+The `leg_trajectory_publisher` C++ node (which streams the resampled `LegTrajectory` message out
+at its own pace) already polls at 1000 Hz and advances to whatever command is due *now* rather than
+one command per tick, so it keeps pace with the resampled stream without additional changes.
 
 ---
 
@@ -171,7 +212,7 @@ float32 torq_estimate  # Nm
 | `motor_id` / `can_id` | `0` | CAN node ID (0–7) |
 | `motor_type` | `AK40-10` | Motor model string |
 | `interface` / `can_interface` | `can0` | SocketCAN interface name |
-| `control_hz` | `500.0` | Setpoint stream / command rate. Higher = finer, smoother position streaming |
+| `control_hz` | `1000.0` | Setpoint stream / command rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
 | `pole_pairs` | `0` | Rotor pole pairs for ERPM scaling (`0` = per-motor table default) |
 | `gear_ratio` | `0.0` | Gear reduction for ERPM/torque scaling (`0` = per-motor table default) |
 | `position_mode` | `pos_spd` | Startup POSITION submode: `pos_spd` (feed-forward, smooth) or `pos` (plain SET_POS, accurate at all freq). Switchable at runtime via the `pos`/`pos_spd` special commands |

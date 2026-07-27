@@ -64,7 +64,7 @@ Type `help` at the prompt to list all commands. Type `help <command>` for detail
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `run_trajectory` | `<file> <loops> <hz> [<file2> <loops2> <hz2> ...]` | Play one or more trajectory files open-loop. Tab-completes filenames from `leg_trajectory_publisher/trajectories/`. |
+| `run_trajectory` | `<file> <loops> <hz> [<file2> <loops2> <hz2> ...]` | Play one or more trajectory files open-loop. Tab-completes filenames from `leg_trajectory_publisher/trajectories/`. Each file is resampled to a constant setpoint rate (`TRAJECTORY_RESAMPLE_HZ`, default 1000 Hz) regardless of `<hz>`, so the delivered rate stays within the CAN/motor-node budget instead of scaling with frequency — see [Actuation](../actuation/README.md#run_trajectory-and-setpoint-resampling). |
 | `run_trajectory_record` | same as above | Same as `run_trajectory`, but automatically starts a rosbag before the run and stops it after. Refuses to start if already recording. |
 
 ### Closed-Loop Gait Commands
