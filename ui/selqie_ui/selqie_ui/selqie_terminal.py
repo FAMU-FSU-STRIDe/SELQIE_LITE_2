@@ -142,8 +142,18 @@ class SELQIETerminal(Cmd):
                 file = args[seg]
                 num_loops = int(args[seg+1])
                 frequency = float(args[seg+2])
-                rate = self._selqie.create_rate(frequency)
+                # Load/resample before creating the rate: this is the one-time,
+                # non-negligible cost per file (parsing + resampling every leg).
+                # If the rate were created first, that cost would eat straight
+                # into loop 1's sleep budget -- only loop 1 sits in front of it,
+                # since `trajectories` is computed once outside this loop -- so
+                # loop 2 would fire early and restart the leg_trajectory_publisher
+                # partway through loop 1 (visible as an early truncate-and-restart,
+                # and as physical foot drag on whichever legs were in stance at
+                # that moment). Loading first means the first full period starts
+                # with zero setup debt, same as every loop after it.
                 trajectories = self._selqie.get_leg_trajectories_from_file(file, frequency)
+                rate = self._selqie.create_rate(frequency)
                 print(f"Running trajectory for {num_loops} loops at {frequency} Hz")
                 for loop_idx in range(num_loops):
                     print(f"  Loop {loop_idx+1}/{num_loops}")
@@ -188,8 +198,10 @@ class SELQIETerminal(Cmd):
         print(f"Started recording rosbag (tag: {tag})")
         try:
             for file, num_loops, frequency in specs:
-                rate = self._selqie.create_rate(frequency)
+                # See do_run_trajectory: load/resample before creating the rate so
+                # the one-time per-file cost doesn't eat into loop 1's sleep budget.
                 trajectories = self._selqie.get_leg_trajectories_from_file(file, frequency)
+                rate = self._selqie.create_rate(frequency)
                 print(f"Running trajectory for {num_loops} loops at {frequency} Hz")
                 for i in range(num_loops):
                     print(f"  Loop {i+1}/{num_loops}")
