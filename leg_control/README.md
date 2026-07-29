@@ -98,9 +98,19 @@ geometry_msgs/Vector3 force_estimate # N
 
 **LegTrajectory**
 ```
-LegCommand[] waypoints
-float32[]    timestamps   # s from start
+float64[]    timing       # s from start, one per command
+LegCommand[] commands
+
+# Optional playback control (all default to 0 = play once, anchored on arrival)
+uint32  loops             # repetitions to play back-to-back; 0/1 = once
+float64 period            # cycle duration (s) used to schedule repeats
+float64 start_time        # ROS time (s) to start at; shared across legs
 ```
+
+`loops`/`period`/`start_time` let `leg_trajectory_publisher_node` repeat a stride natively, so a
+multi-loop run publishes once instead of republishing every cycle — see
+[Actuation](../actuation/README.md#multi-loop-runs-repeat-natively-no-republishing) for why that
+matters for motion quality.
 
 ---
 

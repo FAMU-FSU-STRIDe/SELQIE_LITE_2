@@ -76,6 +76,21 @@ def _lerp_leg_command(a: 'LegCommand', b: 'LegCommand', frac: float) -> 'LegComm
     msg.force_setpoint = _lerp_vector3(a.force_setpoint, b.force_setpoint, frac)
     return msg
 
+def leg_trajectory_period(times: list[float]) -> float:
+    """Cycle duration of a trajectory whose samples span ``times``.
+
+    The samples cover [t_first, t_last], which is one sample-step short of a
+    full cycle -- the next repetition's first sample belongs one step after
+    t_last. Adding the average step back recovers the true period, so repeating
+    the cycle is seamless instead of losing a step per repetition.
+    """
+    n = len(times)
+    if n < 2:
+        return 0.0
+    span = times[-1] - times[0]
+    return span + (span / (n - 1))
+
+
 def resample_leg_trajectory(times: list[float], commands: list['LegCommand'],
                             resample_hz: float, max_points: int = 0):
     """Resample one leg's trajectory to a constant setpoint rate.
@@ -135,7 +150,7 @@ def resample_leg_trajectory(times: list[float], commands: list['LegCommand'],
     t_start = times[0]
     t_end = times[-1]
     avg_step = (t_end - t_start) / (n - 1)
-    period = (t_end - t_start) + avg_step  # includes the wrap-around gap
+    period = leg_trajectory_period(times)  # includes the wrap-around gap
 
     step = 1.0 / resample_hz
     num_new = max(1, int(math.ceil(period / step)))
@@ -242,7 +257,11 @@ class SELQIE(Node):
         # control_hz launch parameter, since a higher resample rate than the
         # motor node consumes buys nothing -- the node just samples its latest
         # cached command each control tick.
-        self.TRAJECTORY_RESAMPLE_HZ = 1000.0
+        self.TRAJECTORY_RESAMPLE_HZ = 500.0
+        # Lead time (s) stamped onto a trajectory's start_time so all 4 legs
+        # begin from one shared phase reference. It only has to cover the
+        # spread of the 4 sequential publishes' arrival times.
+        self.TRAJECTORY_START_DELAY = 0.1
         # Hard cap on resampled points per leg per cycle, which bounds the
         # serialized LegTrajectory message size (~84 bytes/point/leg, x4 legs
         # per republish). Rate alone does not bound size: a low run frequency
@@ -571,12 +590,44 @@ class SELQIE(Node):
                 self.TRAJECTORY_MAX_POINTS)
             leg_trajectories[leg_id].timing = new_times
             leg_trajectories[leg_id].commands = new_commands
+            # Tell the publisher the true cycle duration so it can repeat the
+            # stride natively, phase-exactly, without the sender republishing.
+            leg_trajectories[leg_id].period = leg_trajectory_period(new_times)
         return leg_trajectories
-    
-    def run_leg_trajectories(self, trajectories : list[LegTrajectory]):
-        """Run a list of LegTrajectory messages."""
+
+    def get_leg_trajectory_period(self, trajectories : list[LegTrajectory]) -> float:
+        """Cycle duration (s) of a set of leg trajectories, 0.0 if unavailable."""
+        for traj in trajectories:
+            if traj is not None and traj.period > 0.0:
+                return float(traj.period)
+        return 0.0
+
+    def run_leg_trajectories(self, trajectories : list[LegTrajectory],
+                             loops : int = 1, start_delay : float = None):
+        """Run a list of LegTrajectory messages.
+
+        ``loops`` is played natively by leg_trajectory_publisher_node, so the
+        stride repeats without the caller republishing once per cycle. That
+        matters because every republish resets a leg to the start of its
+        stride: doing it per cycle turns any timing jitter into a mid-stride
+        snap-back (a twitch), whereas repeating in the publisher wraps only
+        once the previous repetition has genuinely finished.
+
+        ``start_delay`` seconds are added to the current time and stamped on
+        every leg's message as a shared start instant. The 4 legs are published
+        sequentially and each message takes non-zero time to serialize and
+        traverse DDS, so without a common anchor each leg would begin at its
+        own arrival time -- a phase stagger between legs. The delay just needs
+        to cover the spread of those arrivals.
+        """
+        loops = max(1, int(loops))
+        if start_delay is None:
+            start_delay = self.TRAJECTORY_START_DELAY
+        start_time = self.get_clock().now().nanoseconds / 1e9 + max(0.0, start_delay)
         for i in range(len(trajectories)):
             if trajectories[i] is not None:
+                trajectories[i].loops = loops
+                trajectories[i].start_time = start_time
                 self.send_leg_trajectory(i, trajectories[i])
 
     ############################
