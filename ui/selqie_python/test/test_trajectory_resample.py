@@ -106,7 +106,8 @@ def _install_stubs():
             control_mode=0, pos_setpoint=Vector3,
             vel_setpoint=Vector3, force_setpoint=Vector3,
         ),
-        'LegTrajectory': dict(timing=list, commands=list),
+        'LegTrajectory': dict(timing=list, commands=list,
+                              loops=0, period=0.0, start_time=0.0),
         'LegEstimate': dict(
             pos_estimate=Vector3, vel_estimate=Vector3, force_estimate=Vector3,
         ),
@@ -262,6 +263,27 @@ def test_max_points_disabled_by_zero_or_negative():
     for disabled in (0, -1):
         got, _ = sq.resample_leg_trajectory(times, commands, 1000.0, disabled)
         assert len(got) == len(base)
+
+
+def test_leg_trajectory_period_recovers_full_cycle():
+    # 500 samples at 2ms span 0..0.998s, but the cycle is a full 1.000s: the
+    # next repetition's first sample belongs one step after the last. Getting
+    # this wrong would drop a step per repetition and drift the gait.
+    times = [i * 0.002 for i in range(500)]
+    assert sq.leg_trajectory_period(times) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_leg_trajectory_period_degenerate_inputs():
+    assert sq.leg_trajectory_period([]) == 0.0
+    assert sq.leg_trajectory_period([0.5]) == 0.0
+
+
+def test_leg_trajectory_period_matches_resampler_output():
+    # A resampled cycle's own period must round-trip: resampling a trajectory
+    # and re-measuring it must give back the period it was built to span.
+    times, commands = _uniform_cycle(n=500, dt=0.002)
+    new_times, _ = sq.resample_leg_trajectory(times, commands, 500.0, 1000)
+    assert sq.leg_trajectory_period(new_times) == pytest.approx(1.0, abs=1e-3)
 
 
 def test_control_mode_is_held_not_blended():

@@ -42,7 +42,29 @@ private:
 
     std::size_t _idx = 0;           // Current index in the trajectory
     LegTrajectory::SharedPtr _traj; // Pointer to the current leg trajectory
-    double _start_time;       // Start time of the trajectory
+    double _start_time;       // Start time of the current repetition
+
+    uint32_t _loops_total = 1;   // Repetitions requested (1 = play once)
+    uint32_t _loops_done = 0;    // Repetitions completed so far
+    double _period = 0.0;        // Cycle duration used to schedule repeats
+
+    /*
+     * Derive the cycle duration from the timing array.
+     * The samples span [t_first, t_last], which is one sample-step short of a
+     * full cycle: the next repetition's first sample belongs one step after
+     * t_last. Adding the average step back recovers the true period, so that
+     * repeating the trajectory is seamless rather than losing a step each time.
+     */
+    static double _derive_period(const std::vector<double> &timing)
+    {
+        const std::size_t n = timing.size();
+        if (n < 2)
+        {
+            return 0.0;
+        }
+        const double span = timing.back() - timing.front();
+        return span + (span / static_cast<double>(n - 1));
+    }
 
     /*
      * Trajectory callback function
@@ -72,7 +94,26 @@ private:
             // Reset the trajectory index and start time
             _idx = 0;
             _traj = msg;
-            _start_time = this->now().seconds();
+
+            // Anchor playback. An explicit start_time lets every leg share one
+            // phase reference even though their messages arrive at slightly
+            // different times; without it, fall back to the arrival time.
+            _start_time = (msg->start_time > 0.0) ? msg->start_time : this->now().seconds();
+
+            // Repeat natively rather than making the sender republish per cycle.
+            _loops_total = (msg->loops == 0) ? 1 : msg->loops;
+            _loops_done = 0;
+            _period = (msg->period > 0.0) ? msg->period : _derive_period(msg->timing);
+
+            // Without a usable period there is nothing to schedule repeats
+            // against, so fall back to playing the trajectory once.
+            if (_loops_total > 1 && _period <= 0.0)
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Cannot repeat trajectory %u times without a period; playing once",
+                            _loops_total);
+                _loops_total = 1;
+            }
 
             // Activate the node if not already active
             if (!_timer)
@@ -138,10 +179,25 @@ private:
         _leg_command_pub->publish(_traj->commands[next - 1]);
         _idx = next;
 
-        // Check if the trajectory has been fully played out
+        // Check if this repetition has been fully played out
         if (_idx >= _traj->timing.size())
         {
-            // If so, deactivate the trajectory publisher
+            _loops_done++;
+
+            if (_loops_done < _loops_total)
+            {
+                // Start the next repetition. Advancing the anchor by exactly one
+                // period (rather than re-anchoring to "now") keeps repetitions
+                // phase-exact and stops scheduling slop from accumulating across
+                // a long run. Rewinding the index here is a seamless wrap, not a
+                // mid-stride reset, because it happens only once the previous
+                // repetition has actually finished.
+                _idx = 0;
+                _start_time += _period;
+                return;
+            }
+
+            // All repetitions done: deactivate the trajectory publisher
 
             // Cancel the timer
             _timer->cancel();

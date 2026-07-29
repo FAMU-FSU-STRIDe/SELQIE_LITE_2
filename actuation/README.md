@@ -57,7 +57,7 @@ the stand/ready hold.**
 * **`pos` — plain `SET_POS`.** The driver drives to each streamed setpoint using the motor's **full
   physical acceleration**, so it tracks position accurately at *every* gait frequency — used for all
   gaits. It is not acceleration-shaped, so a *coarse* setpoint stream would move as a slam-and-wait
-  staircase and can ring; the node streams finely at a high `control_hz` (default **1000 Hz**) so the
+  staircase and can ring; the node streams finely at a high `control_hz` (default **500 Hz**) so the
   position steps are small and the motion stays smooth.
 
 * **`pos_spd` — `SET_POS_SPD` (§5.1.7)** with a velocity feed-forward derived from the change in
@@ -73,14 +73,13 @@ the stand/ready hold.**
   still reach their target. It only binds when the trajectory is (near-)stationary.
 
 **Why `control_hz` matters.** `run_trajectory` resamples gait files to a constant
-`TRAJECTORY_RESAMPLE_HZ` (default 1000 Hz, see `selqie_python.selqie`) regardless of the run
+`TRAJECTORY_RESAMPLE_HZ` (default 500 Hz, see `selqie_python.selqie`) regardless of the run
 frequency, so the setpoint stream rate is bounded at any frequency rather than scaling with it — see
 "`run_trajectory` and setpoint resampling" below. The motor node samples the latest setpoint at
 `control_hz`; it should match (or exceed) `TRAJECTORY_RESAMPLE_HZ`, since a lower rate would just
-undersample the resampled stream and reintroduce the staircase/ring problem. Default is **1000 Hz**
-on both sides. CAN load at 1000 Hz TX + up to 500 Hz status feedback (the driver's upload-rate cap,
-§5.2.1) is ~78% of a 1 Mbps bus with 4 motors — within budget but tighter than the previous 500 Hz
-default (~54%); watch bus utilization if you add motors per bus or raise the status upload rate.
+undersample the resampled stream and reintroduce the staircase/ring problem. Default is **500 Hz**
+on both sides. CAN load at 500 Hz TX + up to 500 Hz status feedback (the driver's upload-rate cap,
+§5.2.1) is ~54% of a 1 Mbps bus with 4 motors, leaving comfortable headroom.
 
 > **Notation trap:** servo **position** is output-shaft referenced, but servo **speed** is
 > *rotor-electrical* (ERPM). That asymmetry is why velocity conversion carries a `gear × pole_pairs`
@@ -109,7 +108,7 @@ what a 1 Mbps CAN bus with 4 motors can sustain (~1500/s/motor is a realistic ce
 either gets dropped unevenly or truncates the stride before it finishes.
 
 `SELQIE.get_leg_trajectories_from_file` (in `selqie_python.selqie`) avoids this by **resampling**
-each leg's cycle to a constant setpoint rate, `TRAJECTORY_RESAMPLE_HZ` (default **1000 Hz**),
+each leg's cycle to a constant setpoint rate, `TRAJECTORY_RESAMPLE_HZ` (default **500 Hz**),
 independent of `f`. The cycle is linearly interpolated and re-sampled evenly, so the delivered rate
 is bounded at *every* run frequency:
 
@@ -117,24 +116,17 @@ A second bound, `TRAJECTORY_MAX_POINTS` (default **1000**), caps how many points
 contain. Rate alone does not bound *message size*: at a low `f` the cycle is long, so a fixed rate
 keeps adding points. Together they give:
 
-| `f` | points/cycle (rate only) | points/cycle (with cap) | bytes per republish (4 legs) |
+| `f` | points/cycle (rate only) | points/cycle (with cap) | bytes sent per run (4 legs) |
 |---|---|---|---|
-| 0.25 | ~4000 | **1000** | 1315 KB → **328 KB** |
-| 0.5 | ~2000 | **1000** | 658 KB → **328 KB** |
-| 1 | ~1000 | ~1000 | 328 KB (cap does not bind) |
-| 2 | ~500 | ~500 | 165 KB (matches the source file) |
-| 5 | ~200 | ~200 | 66 KB |
+| 0.25 | ~2000 | **1000** | 656 KB → **328 KB** |
+| 0.5 | ~1000 | **1000** | 328 KB (cap just binds) |
+| 1 | ~500 | ~500 | 165 KB (matches the source file) |
+| 2 | ~250 | ~250 | 82 KB |
+| 5 | ~100 | ~100 | 33 KB |
 
 Nothing is unevenly dropped or the stride cut short — every frequency gets a complete, evenly-spaced
 cycle, just at a resolution that trades off against frequency instead of exceeding the transport's
 bandwidth. When the cap binds, the step is widened so the capped points still span the whole cycle.
-
-**Why the cap matters for motion quality:** each republish resets every leg to the start of its
-stride, and `run_leg_trajectories` publishes the 4 legs *sequentially*. A large message takes longer
-to serialize and push through DDS, so the four resets land staggered — visible as per-leg twitching,
-worst at low `f` where the messages were largest. Capping bounds that. Note that a slow delivery does
-**not** show up as the terminal's period-overrun warning, because `publish()` hands off to DDS and
-returns before delivery completes.
 
 Capping costs little in smoothness: what matters is the position delta *per setpoint*, not the
 absolute rate, and foot speed scales down with `f`, so a fixed points-per-cycle budget holds that
@@ -143,11 +135,32 @@ source files (330–500 points/cycle).
 
 `TRAJECTORY_RESAMPLE_HZ` should be kept **≤ the motor nodes' `control_hz`** — resampling faster than
 the motor node consumes buys nothing, since the node just samples its latest cached command each
-control tick. Both default to 1000 Hz.
+control tick. Both default to 500 Hz.
 
-The `leg_trajectory_publisher` C++ node (which streams the resampled `LegTrajectory` message out
-at its own pace) already polls at 1000 Hz and advances to whatever command is due *now* rather than
-one command per tick, so it keeps pace with the resampled stream without additional changes.
+### Multi-loop runs repeat natively (no republishing)
+
+A `LegTrajectory` carries optional playback fields — `loops`, `period`, and `start_time` — that
+`leg_trajectory_publisher_node` honours. `run_trajectory` therefore publishes each leg's trajectory
+**once for the whole run** and lets the C++ node repeat it, instead of republishing once per cycle.
+
+This matters because *every* trajectory message resets the publisher to the start of the stride.
+Republishing per cycle meant that reset had to land exactly at the stride boundary; any timing
+slop landed it mid-stride and snapped the foot back — a twitch whose size was exactly the timing
+error. And since the 4 legs are published sequentially, their resets landed staggered, so a single
+leg could twitch on its own. Repeating natively wraps only once a repetition has genuinely
+finished, and advances the anchor by exactly one `period`, so repeats stay phase-exact and
+drift-free with nothing to mistime.
+
+`start_time` stamps one shared start instant on all 4 legs, so they begin phase-aligned rather than
+each at its own message-arrival time. All fields default to zero, which reproduces the original
+behaviour (play once, anchored on arrival) for other producers such as `swing_leg_node`.
+
+Because motion timing now lives entirely in the C++ publisher, it no longer depends on Python or on
+the ROS executor — which is significant, since `SELQIE` spins single-threaded while absorbing
+`motor_state` and `error_code` from 8 motors (up to ~8000 msg/s at a 500 Hz status upload rate).
+
+The `leg_trajectory_publisher` C++ node polls at 1000 Hz and advances to whatever command is due
+*now* rather than one command per tick, so it keeps pace with the resampled stream.
 
 ---
 
@@ -229,7 +242,7 @@ float32 torq_estimate  # Nm
 | `motor_id` / `can_id` | `0` | CAN node ID (0–7) |
 | `motor_type` | `AK40-10` | Motor model string |
 | `interface` / `can_interface` | `can0` | SocketCAN interface name |
-| `control_hz` | `1000.0` | Setpoint stream / command rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
+| `control_hz` | `500.0` | Setpoint stream / command rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
 | `pole_pairs` | `0` | Rotor pole pairs for ERPM scaling (`0` = per-motor table default) |
 | `gear_ratio` | `0.0` | Gear reduction for ERPM/torque scaling (`0` = per-motor table default) |
 | `position_mode` | `pos_spd` | Startup POSITION submode: `pos_spd` (feed-forward, smooth) or `pos` (plain SET_POS, accurate at all freq). Switchable at runtime via the `pos`/`pos_spd` special commands |

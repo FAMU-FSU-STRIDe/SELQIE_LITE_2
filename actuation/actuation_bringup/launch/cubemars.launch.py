@@ -58,7 +58,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'control_hz',
-            default_value='1000.0',
+            default_value='500.0',
             description='Control loop / setpoint stream rate in Hz. Higher = finer, smoother '
                         'position streaming for plain SET_POS. Matches selqie_python\'s '
                         'TRAJECTORY_RESAMPLE_HZ so run_trajectory setpoints are not '

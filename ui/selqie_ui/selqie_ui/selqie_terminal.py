@@ -128,43 +128,45 @@ class SELQIETerminal(Cmd):
             print("Invalid force values")
 
     def _run_trajectory_loops(self, trajectories, num_loops : int, frequency : float):
-        """ Republish a trajectory once per period, on a monotonic deadline.
+        """ Publish the trajectory ONCE and let the publisher repeat it natively.
 
-        Every republish makes leg_trajectory_publisher_node reset _idx=0 and
-        _start_time=now(), i.e. it snaps each leg's target back to the start of
-        the stride *immediately*, from wherever the foot currently is. So the
-        loop period has to be accurate: if a republish lands early, the foot
-        jumps mid-stride back to stride-start, which shows up as a twitch whose
-        size is exactly the timing error.
+        Republishing once per cycle -- the previous approach -- was itself the
+        problem: every trajectory message resets leg_trajectory_publisher_node
+        to the start of the stride, so any jitter in the republish timing landed
+        that reset mid-stride and snapped the foot back (a twitch). Publishing
+        the 4 legs sequentially also meant their resets landed staggered, which
+        is why a single leg could twitch on its own.
 
-        This deliberately does NOT use rclpy's create_rate()/Rate.sleep(). That
-        wakes up off a ROS timer serviced by the executor -- here a single
-        threaded rclpy.spin_once() loop that is also absorbing motor_state and
-        error_code from 8 motors (up to ~8000 msg/s at a 500 Hz status upload
-        rate), plus stereo images. Under that load the rate's wake-up is late by
-        an unpredictable amount, which is precisely the random, occasional
-        twitch signature. time.monotonic() is immune to executor starvation.
+        Now the loop count travels with the message and the publisher repeats
+        the stride in C++, advancing its anchor by exactly one period per
+        repetition. Nothing republishes mid-run, so there is no reset to
+        mistime, no per-cycle stagger between legs, and no dependence on Python
+        or the ROS executor for motion timing. All 4 legs also share one stamped
+        start instant, so they begin phase-aligned rather than at their own
+        arrival times.
 
-        Deadlines are absolute (next_deadline += period) so scheduling slop does
-        not accumulate into a growing phase drift across loops.
+        This function is then only responsible for waiting out the run and
+        reporting progress -- its timing no longer affects the motion at all.
         """
-        period = 1.0 / frequency
-        next_deadline = time.monotonic()
+        period = self._selqie.get_leg_trajectory_period(trajectories)
+        if period <= 0.0:
+            # Fall back to the commanded frequency if the trajectory did not
+            # carry a period (e.g. a hand-built message).
+            period = 1.0 / frequency
+
+        self._selqie.run_leg_trajectories(trajectories, loops=num_loops)
+
+        # Wait out the run. This is progress reporting only -- the publisher is
+        # already executing the whole sequence on its own clock -- but it must
+        # not return early, or the caller's cleanup (switching back to the
+        # pos_spd stand submode) would fire while the stride is still playing.
+        # Playback begins one start-delay after the publish, so include it.
+        start = time.monotonic() + self._selqie.TRAJECTORY_START_DELAY
         for loop_idx in range(num_loops):
             print(f"  Loop {loop_idx+1}/{num_loops}")
-            self._selqie.run_leg_trajectories(trajectories)
-            next_deadline += period
-            remaining = next_deadline - time.monotonic()
+            remaining = (start + (loop_idx + 1) * period) - time.monotonic()
             if remaining > 0.0:
                 time.sleep(remaining)
-            else:
-                # Publishing itself outran the period, so the stride was already
-                # being cut short before we could sleep. Warn (this is the thing
-                # to act on -- see the trajectory message sizes in the actuation
-                # README) and resync rather than spiral further behind.
-                print(f"  WARNING: publish overran the {period*1000:.0f}ms period "
-                      f"by {-remaining*1000:.0f}ms; stride was truncated")
-                next_deadline = time.monotonic()
 
     def do_run_trajectory(self, line : str):
         """ Run a trajectory file or sequence of files """
