@@ -113,16 +113,33 @@ each leg's cycle to a constant setpoint rate, `TRAJECTORY_RESAMPLE_HZ` (default 
 independent of `f`. The cycle is linearly interpolated and re-sampled evenly, so the delivered rate
 is bounded at *every* run frequency:
 
-| `f` | resampled points/cycle (1000 Hz, 500-point/1 s file) |
-|---|---|
-| 1 | ~1000 (denser than the source file) |
-| 2 | ~500 (matches the source file) |
-| 5 | ~200 |
+A second bound, `TRAJECTORY_MAX_POINTS` (default **1000**), caps how many points a single cycle may
+contain. Rate alone does not bound *message size*: at a low `f` the cycle is long, so a fixed rate
+keeps adding points. Together they give:
+
+| `f` | points/cycle (rate only) | points/cycle (with cap) | bytes per republish (4 legs) |
+|---|---|---|---|
+| 0.25 | ~4000 | **1000** | 1315 KB → **328 KB** |
+| 0.5 | ~2000 | **1000** | 658 KB → **328 KB** |
+| 1 | ~1000 | ~1000 | 328 KB (cap does not bind) |
+| 2 | ~500 | ~500 | 165 KB (matches the source file) |
+| 5 | ~200 | ~200 | 66 KB |
 
 Nothing is unevenly dropped or the stride cut short — every frequency gets a complete, evenly-spaced
 cycle, just at a resolution that trades off against frequency instead of exceeding the transport's
-bandwidth. This also incidentally smooths low-frequency gaits, since they're now *upsampled* (denser
-than the original file) rather than replayed at the file's native sparse spacing.
+bandwidth. When the cap binds, the step is widened so the capped points still span the whole cycle.
+
+**Why the cap matters for motion quality:** each republish resets every leg to the start of its
+stride, and `run_leg_trajectories` publishes the 4 legs *sequentially*. A large message takes longer
+to serialize and push through DDS, so the four resets land staggered — visible as per-leg twitching,
+worst at low `f` where the messages were largest. Capping bounds that. Note that a slow delivery does
+**not** show up as the terminal's period-overrun warning, because `publish()` hands off to DDS and
+returns before delivery completes.
+
+Capping costs little in smoothness: what matters is the position delta *per setpoint*, not the
+absolute rate, and foot speed scales down with `f`, so a fixed points-per-cycle budget holds that
+delta roughly constant. The cap only binds at low `f`, where 1000 points is still denser than the
+source files (330–500 points/cycle).
 
 `TRAJECTORY_RESAMPLE_HZ` should be kept **≤ the motor nodes' `control_hz`** — resampling faster than
 the motor node consumes buys nothing, since the node just samples its latest cached command each

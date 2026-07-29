@@ -203,6 +203,67 @@ def test_interpolated_values_track_the_original_curve():
         assert c.pos_setpoint.x == pytest.approx(expected, abs=0.05)
 
 
+def test_max_points_caps_low_frequency_message_size():
+    # A 2s cycle (500-point/1s file run at frequency=0.5) at 1000Hz would be
+    # 2000 points; the cap must hold it to 1000 while still covering the cycle.
+    times, commands = _uniform_cycle(n=500, dt=0.002 / 0.5)  # 2s cycle
+    uncapped, _ = sq.resample_leg_trajectory(times, commands, 1000.0)
+    capped, capped_cmds = sq.resample_leg_trajectory(times, commands, 1000.0, 1000)
+
+    assert len(uncapped) == pytest.approx(2000, abs=1)
+    assert len(capped) == 1000
+    assert len(capped_cmds) == 1000
+    # Still spans the whole cycle (does not truncate the stride).
+    assert capped[-1] == pytest.approx(uncapped[-1], abs=0.01)
+
+
+def test_max_points_keeps_even_spacing():
+    times, commands = _uniform_cycle(n=500, dt=0.002 / 0.5)
+    capped, _ = sq.resample_leg_trajectory(times, commands, 1000.0, 1000)
+    gaps = [capped[i + 1] - capped[i] for i in range(len(capped) - 1)]
+    assert all(g == pytest.approx(gaps[0], abs=1e-9) for g in gaps)
+
+
+def test_max_points_does_not_bind_at_high_frequency():
+    # A 5x-compressed cycle only needs ~200 points, well under the cap, so the
+    # cap must not perturb it at all.
+    times, commands = _uniform_cycle(n=500, dt=0.002 / 5.0)
+    uncapped, _ = sq.resample_leg_trajectory(times, commands, 1000.0)
+    capped, _ = sq.resample_leg_trajectory(times, commands, 1000.0, 1000)
+    assert len(capped) == len(uncapped)
+    assert capped == pytest.approx(uncapped)
+
+
+def test_max_points_is_exactly_min_of_rate_limit_and_cap():
+    # Precise contract: the cap composes with the rate limit, never fights it.
+    for freq in (0.25, 0.5, 1.0, 2.0, 5.0):
+        times, commands = _uniform_cycle(n=500, dt=0.002 / freq)
+        uncapped, _ = sq.resample_leg_trajectory(times, commands, 1000.0)
+        capped, _ = sq.resample_leg_trajectory(times, commands, 1000.0, 1000)
+        assert len(capped) == min(len(uncapped), 1000), f'freq={freq}'
+
+
+def test_cap_does_not_make_low_frequency_sparser_than_source():
+    # At the low frequencies where the cap actually binds (and where the
+    # twitching was reported), the result must still be no coarser than the
+    # source file's own density. At high frequency the *rate* limit dominates
+    # and intentionally goes below source density -- that is the CAN bandwidth
+    # bound, not the cap, and is covered by the downsampling test above.
+    source_pts = 500
+    for freq in (0.25, 0.5, 1.0):
+        times, commands = _uniform_cycle(n=source_pts, dt=0.002 / freq)
+        capped, _ = sq.resample_leg_trajectory(times, commands, 1000.0, 1000)
+        assert len(capped) >= source_pts, f'freq={freq}'
+
+
+def test_max_points_disabled_by_zero_or_negative():
+    times, commands = _uniform_cycle(n=500, dt=0.002 / 0.5)
+    base, _ = sq.resample_leg_trajectory(times, commands, 1000.0)
+    for disabled in (0, -1):
+        got, _ = sq.resample_leg_trajectory(times, commands, 1000.0, disabled)
+        assert len(got) == len(base)
+
+
 def test_control_mode_is_held_not_blended():
     times = [0.0, 0.1, 0.2]
     commands = [_cmd(0, 0, 0, mode=3), _cmd(1, 0, 0, mode=3), _cmd(0, 0, 0, mode=3)]
