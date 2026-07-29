@@ -76,7 +76,8 @@ def _lerp_leg_command(a: 'LegCommand', b: 'LegCommand', frac: float) -> 'LegComm
     msg.force_setpoint = _lerp_vector3(a.force_setpoint, b.force_setpoint, frac)
     return msg
 
-def resample_leg_trajectory(times: list[float], commands: list['LegCommand'], resample_hz: float):
+def resample_leg_trajectory(times: list[float], commands: list['LegCommand'],
+                            resample_hz: float, max_points: int = 0):
     """Resample one leg's trajectory to a constant setpoint rate.
 
     A trajectory file stores a gait cycle as fixed timestamped setpoints (e.g.
@@ -92,6 +93,26 @@ def resample_leg_trajectory(times: list[float], commands: list['LegCommand'], re
     spaced points per cycle at high frequency, denser at low frequency -- so
     nothing is unevenly dropped or the stride cut short by the transport
     layer, and no single frequency is a bandwidth cliff.
+
+    ``max_points`` (<=0 disables) additionally caps how many points a single
+    cycle may contain, which bounds the serialized LegTrajectory message size.
+    Rate alone does not: at a *low* run frequency the cycle is long, so a fixed
+    rate produces proportionally more points (1000 Hz over a 2 s cycle is 2000
+    points/leg, ~164 KB/leg, ~656 KB per republish across 4 legs). Those large
+    messages take longer to serialize and push through DDS, and because the 4
+    legs are published sequentially they land staggered -- which shows up as
+    per-leg twitching at low frequency, since every republish resets the leg to
+    the start of its stride. When the cap binds, the step is widened so the
+    capped number of points still spans the whole cycle evenly.
+
+    Capping costs little in motion quality, because what matters for smoothness
+    is the position delta *per setpoint*, not the absolute rate: foot speed
+    scales down with frequency, so a fixed points-per-cycle budget holds that
+    delta roughly constant. The cap only ever binds at low frequency, where a
+    1000-point budget still leaves the cycle denser than the source files
+    (330-500 points). At high frequency the rate limit dominates instead and
+    does intentionally go below source density -- that is the CAN bandwidth
+    bound described above, and is the trade Option 1 exists to make.
 
     ``times`` must be sorted ascending (they are the already frequency-scaled
     per-cycle timestamps, i.e. what the caller would have used directly before
@@ -118,6 +139,12 @@ def resample_leg_trajectory(times: list[float], commands: list['LegCommand'], re
 
     step = 1.0 / resample_hz
     num_new = max(1, int(math.ceil(period / step)))
+
+    # Cap the per-cycle point count and widen the step to match, so the capped
+    # points still span the full cycle evenly rather than truncating it.
+    if max_points > 0 and num_new > max_points:
+        num_new = max_points
+        step = period / num_new
 
     new_times = []
     new_commands = []
@@ -216,6 +243,15 @@ class SELQIE(Node):
         # motor node consumes buys nothing -- the node just samples its latest
         # cached command each control tick.
         self.TRAJECTORY_RESAMPLE_HZ = 1000.0
+        # Hard cap on resampled points per leg per cycle, which bounds the
+        # serialized LegTrajectory message size (~84 bytes/point/leg, x4 legs
+        # per republish). Rate alone does not bound size: a low run frequency
+        # means a long cycle, so a fixed rate keeps adding points. Large
+        # messages serialize/deliver slowly and, since the 4 legs are published
+        # sequentially, land staggered -- which shows up as per-leg twitching at
+        # low frequency. 1000 keeps every frequency at or above the source
+        # files' own density (they carry 330-500 points/cycle).
+        self.TRAJECTORY_MAX_POINTS = 1000
 
         self._leg_command_publishers = []
         for i in range(self.NUM_LEGS):
@@ -531,7 +567,8 @@ class SELQIE(Node):
         leg_trajectories = [LegTrajectory() for _ in range(self.NUM_LEGS)]
         for leg_id in range(self.NUM_LEGS):
             new_times, new_commands = resample_leg_trajectory(
-                raw_times[leg_id], raw_commands[leg_id], self.TRAJECTORY_RESAMPLE_HZ)
+                raw_times[leg_id], raw_commands[leg_id], self.TRAJECTORY_RESAMPLE_HZ,
+                self.TRAJECTORY_MAX_POINTS)
             leg_trajectories[leg_id].timing = new_times
             leg_trajectories[leg_id].commands = new_commands
         return leg_trajectories
