@@ -329,3 +329,75 @@ def test_frequency_scaling_matches_manual_precompression():
     new_times, new_commands = sq.resample_leg_trajectory(scaled_times, commands, 200.0)
     assert new_times[-1] <= base_times[-1] / 2.0 + 1e-9
     assert len(new_times) == pytest.approx(100, abs=1)  # half the duration, same rate -> half pts
+
+
+# --------------------- velocity estimation ------------------------------
+
+
+def test_velocity_matches_analytic_derivative():
+    # x(t) = sin(2*pi*t/T) has the exact derivative (2pi/T)*cos(2pi*t/T).
+    n, T = 500, 1.0
+    times = [i * T / n for i in range(n)]
+    cmds = []
+    for t in times:
+        c = _cmd(math.sin(2 * math.pi * t / T), 0.0, 0.0)
+        cmds.append(c)
+    sq.estimate_leg_trajectory_velocities(times, cmds, period=T)
+
+    for t, c in list(zip(times, cmds))[::17]:
+        expected = (2 * math.pi / T) * math.cos(2 * math.pi * t / T)
+        assert c.vel_setpoint.x == pytest.approx(expected, abs=1e-3)
+
+
+def test_velocity_is_continuous_across_the_wrap():
+    # The cycle is periodic, so the first and last samples must not show a
+    # seam spike -- a spurious spike there would kick the leg once per stride.
+    n, T = 200, 1.0
+    times = [i * T / n for i in range(n)]
+    cmds = [_cmd(math.sin(2 * math.pi * t / T), 0.0, 0.0) for t in times]
+    sq.estimate_leg_trajectory_velocities(times, cmds, period=T)
+
+    v = [c.vel_setpoint.x for c in cmds]
+    step = max(abs(v[i + 1] - v[i]) for i in range(len(v) - 1))
+    assert abs(v[0] - v[-1]) <= 3 * step      # wrap is no worse than a normal step
+
+
+def test_velocity_scales_with_frequency():
+    # The same cycle compressed 2x must yield exactly 2x the velocity.
+    n = 200
+    base = [i * 1.0 / n for i in range(n)]
+    fast = [t / 2.0 for t in base]
+
+    def build(times, period):
+        cmds = [_cmd(math.sin(2 * math.pi * i / n), 0.0, 0.0) for i in range(n)]
+        sq.estimate_leg_trajectory_velocities(times, cmds, period=period)
+        return max(abs(c.vel_setpoint.x) for c in cmds)
+
+    assert build(fast, 0.5) == pytest.approx(2.0 * build(base, 1.0), rel=1e-9)
+
+
+def test_velocity_zero_for_a_held_position():
+    # A static pose (the stand hold) must estimate zero velocity, not drift.
+    times = [i * 0.01 for i in range(50)]
+    cmds = [_cmd(0.0, 0.0, -0.18) for _ in times]
+    sq.estimate_leg_trajectory_velocities(times, cmds, period=0.5)
+    assert all(c.vel_setpoint.x == 0.0 and c.vel_setpoint.z == 0.0 for c in cmds)
+
+
+def test_velocity_estimation_handles_degenerate_input():
+    assert sq.estimate_leg_trajectory_velocities([], [], 0.0) == []
+    single = [_cmd(1.0, 2.0, 3.0)]
+    out = sq.estimate_leg_trajectory_velocities([0.0], single, 0.0)
+    assert out[0].vel_setpoint.x == 0.0   # left untouched
+
+
+def test_velocity_estimated_on_all_three_axes():
+    n = 100
+    times = [i * 1.0 / n for i in range(n)]
+    cmds = [_cmd(math.sin(2 * math.pi * i / n),
+                 math.cos(2 * math.pi * i / n),
+                 math.sin(4 * math.pi * i / n)) for i in range(n)]
+    sq.estimate_leg_trajectory_velocities(times, cmds, period=1.0)
+    assert any(c.vel_setpoint.x for c in cmds)
+    assert any(c.vel_setpoint.y for c in cmds)
+    assert any(c.vel_setpoint.z for c in cmds)

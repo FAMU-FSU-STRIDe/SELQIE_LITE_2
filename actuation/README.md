@@ -189,6 +189,48 @@ source files (330–500 points/cycle).
 the motor node consumes buys nothing, since the node just samples its latest cached command each
 control tick. Both default to 500 Hz.
 
+### Velocity feed-forward (why the files' zeros matter)
+
+The shipped trajectory files carry **position setpoints only** — every velocity
+and force column is zero. Under the MIT control law that is actively harmful:
+
+```
+torque = Kp·(p_des − p_meas) + Kd·(v_des − v_meas) + t_ff
+```
+
+With `v_des = 0`, the Kd term becomes `−Kd·v_meas` — damping against **the motion
+itself** rather than against tracking error, so it fights the very stride it is
+supposed to execute. On `walk_20cm_stride.txt` at `Kd = 0.4`:
+
+| gait freq | `Kd·v` with `v_des = 0` | as % of the 4.1 N·m peak | with estimated `v_des` |
+|---|---|---|---|
+| 0.5 | 3.05 N·m | 74% | 0.05 N·m (1.3%) |
+| 1 | 6.11 N·m | **149%** | 0.11 N·m (2.6%) |
+| 2 | 12.21 N·m | 298% | 0.22 N·m (5.2%) |
+| 3 | 18.32 N·m | 447% | 0.32 N·m (7.9%) |
+
+At 1 Hz the damping term alone demands more than the motor's entire peak torque,
+purely to oppose its own commanded motion — the motor saturates fighting itself
+and the leg lags badly.
+
+`get_leg_trajectories_from_file` therefore estimates `vel_setpoint` from the
+position derivative (`estimate_leg_trajectory_velocities`). The resampled cycle
+is exactly uniform in time and periodic, so a **central difference** is clean:
+second-order accurate, and free of the half-sample phase lag a forward
+difference would introduce — which matters, because a lagging feed-forward would
+push against the motion much like the zeros it replaces. Measured against an
+analytic sine derivative the error is **0.003% of peak**, with no spike at the
+cycle wrap.
+
+The Kd term then reads `Kd·(v_des − v_meas)`: ≈0 while tracking well, and biting
+only on genuine deviation — which is what damping should do.
+
+This runs only when a file supplies no velocities, so a trajectory that does
+specify them is respected. Set `TRAJECTORY_ESTIMATE_VELOCITY = False` in
+`selqie_python.selqie` to send the file's zeros verbatim.
+
+---
+
 ### Multi-loop runs repeat natively (no republishing)
 
 A `LegTrajectory` carries optional playback fields — `loops`, `period`, and `start_time` — that

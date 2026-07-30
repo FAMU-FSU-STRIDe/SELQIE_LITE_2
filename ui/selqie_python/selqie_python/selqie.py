@@ -91,6 +91,54 @@ def leg_trajectory_period(times: list[float]) -> float:
     return span + (span / (n - 1))
 
 
+def estimate_leg_trajectory_velocities(times: list[float], commands: list['LegCommand'],
+                                       period: float = 0.0):
+    """Fill in ``vel_setpoint`` by differentiating ``pos_setpoint`` in place.
+
+    The trajectory files carry position setpoints only -- every velocity and
+    force column is zero. That matters a lot in MIT mode, where the driver
+    applies::
+
+        torque = Kp*(p_des - p_meas) + Kd*(v_des - v_meas) + t_ff
+
+    With ``v_des = 0`` the Kd term damps the motion *itself* rather than the
+    tracking error, so it fights the very stride it is meant to execute. On
+    walk_20cm_stride at 1 Hz that costs ~6 N.m against a 4.1 N.m peak -- the
+    motor saturates working against itself. Supplying the intended velocity
+    makes the term ``Kd*(v_des - v_meas)``, which is ~0 while tracking well and
+    only bites on genuine deviation, which is what damping should do.
+
+    Uses a central difference, which for evenly spaced samples is second-order
+    accurate and (unlike a forward difference) introduces no half-sample phase
+    lag -- important here, because a lagging velocity feed-forward would push
+    against the motion exactly like the zeros it replaces.
+
+    The cycle is treated as periodic: the sample before the first is the last,
+    and the sample after the last is the first, one step further on. ``period``
+    supplies that wrap distance; if omitted it is derived from ``times``.
+    Samples are assumed evenly spaced, which holds because this runs on the
+    output of :func:`resample_leg_trajectory`.
+
+    Modifies ``commands`` in place and returns it.
+    """
+    n = len(times)
+    if n < 2:
+        return commands
+
+    if period <= 0.0:
+        period = leg_trajectory_period(times)
+    step = period / n  # uniform after resampling
+
+    positions = [(c.pos_setpoint.x, c.pos_setpoint.y, c.pos_setpoint.z) for c in commands]
+    for i, cmd in enumerate(commands):
+        ahead = positions[(i + 1) % n]
+        behind = positions[(i - 1) % n]
+        cmd.vel_setpoint.x = (ahead[0] - behind[0]) / (2.0 * step)
+        cmd.vel_setpoint.y = (ahead[1] - behind[1]) / (2.0 * step)
+        cmd.vel_setpoint.z = (ahead[2] - behind[2]) / (2.0 * step)
+    return commands
+
+
 def resample_leg_trajectory(times: list[float], commands: list['LegCommand'],
                             resample_hz: float, max_points: int = 0):
     """Resample one leg's trajectory to a constant setpoint rate.
@@ -273,6 +321,12 @@ class SELQIE(Node):
         # begin from one shared phase reference. It only has to cover the
         # spread of the 4 sequential publishes' arrival times.
         self.TRAJECTORY_START_DELAY = 0.1
+        # Estimate vel_setpoint from the position derivative when a trajectory
+        # file supplies no velocities (all the shipped ones carry zeros). In MIT
+        # mode a zero velocity setpoint turns Kd into drag on the stride itself;
+        # see estimate_leg_trajectory_velocities. Set False to send the file's
+        # zeros verbatim.
+        self.TRAJECTORY_ESTIMATE_VELOCITY = True
         # Hard cap on resampled points per leg per cycle, which bounds the
         # serialized LegTrajectory message size (~84 bytes/point/leg, x4 legs
         # per republish). Rate alone does not bound size: a low run frequency
@@ -602,16 +656,29 @@ class SELQIE(Node):
                 raw_times[leg_id].append(time)
                 raw_commands[leg_id].append(msg)
 
+        # The shipped trajectory files carry position setpoints only, with the
+        # velocity columns all zero. Estimating the intended velocity keeps the
+        # MIT Kd term damping tracking *error* instead of the stride itself --
+        # see estimate_leg_trajectory_velocities. Only do it when the file
+        # really has no velocities, so a file that specifies them is respected.
+        source_has_velocity = any(
+            cmd.vel_setpoint.x or cmd.vel_setpoint.y or cmd.vel_setpoint.z
+            for leg_cmds in raw_commands for cmd in leg_cmds)
+        estimate_velocity = self.TRAJECTORY_ESTIMATE_VELOCITY and not source_has_velocity
+
         leg_trajectories = [LegTrajectory() for _ in range(self.NUM_LEGS)]
         for leg_id in range(self.NUM_LEGS):
             new_times, new_commands = resample_leg_trajectory(
                 raw_times[leg_id], raw_commands[leg_id], self.TRAJECTORY_RESAMPLE_HZ,
                 self.TRAJECTORY_MAX_POINTS)
-            leg_trajectories[leg_id].timing = new_times
-            leg_trajectories[leg_id].commands = new_commands
             # Tell the publisher the true cycle duration so it can repeat the
             # stride natively, phase-exactly, without the sender republishing.
-            leg_trajectories[leg_id].period = leg_trajectory_period(new_times)
+            period = leg_trajectory_period(new_times)
+            if estimate_velocity:
+                estimate_leg_trajectory_velocities(new_times, new_commands, period)
+            leg_trajectories[leg_id].timing = new_times
+            leg_trajectories[leg_id].commands = new_commands
+            leg_trajectories[leg_id].period = period
         return leg_trajectories
 
     def get_leg_trajectory_period(self, trajectories : list[LegTrajectory]) -> float:
