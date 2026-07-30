@@ -112,11 +112,21 @@ Three ways to set gains, in increasing convenience:
 
 1. **The YAML file** — the durable, shared default.
 2. **Launch overrides** — `ros2 launch ... position_kp:=8.0 position_kd:=0.5` (blank = use the YAML).
-3. **Live, mid-run** — no relaunch:
-   ```bash
-   ros2 topic pub --once /motor0/set_gains std_msgs/msg/Float64MultiArray "{data: [5.0, 0.4]}"
-   ros2 topic echo /motor0/gains        # read back what a motor is using
+3. **Live, mid-run** — no relaunch. From `selqie_terminal`:
    ```
+   SELQIE> set_gains 8.0 0.6              # all motors
+   SELQIE> set_motor_gains 3 8.0 0.6      # just motor 3
+   SELQIE> gains                          # read back what every motor is using
+   ```
+   Or straight from the command line:
+   ```bash
+   ros2 topic pub --once /motor0/set_gains std_msgs/msg/Float64MultiArray "{data: [8.0, 0.6]}"
+   ros2 topic echo /motor0/gains
+   ```
+   Both accept an optional third value to also set `velocity_kd`. Each node
+   republishes its active gains at 1 Hz, so `gains` always has fresh data even if
+   the terminal started after the motors.
+
    Live values are **not** persisted — copy anything you like back into the YAML.
 
 Quick reference:

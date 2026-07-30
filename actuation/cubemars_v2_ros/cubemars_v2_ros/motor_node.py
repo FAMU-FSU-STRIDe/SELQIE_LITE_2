@@ -198,6 +198,10 @@ class MotorNode(Node):
         self._pos_span = self.R["P_MAX"] - self.R["P_MIN"]
 
         self.create_timer(1.0 / self.control_hz, self._tick)
+        # Republish the active gains at a low rate so a client that connects
+        # after startup -- the terminal, or `ros2 topic echo` -- can always read
+        # the current values instead of having to wait for the next change.
+        self.create_timer(1.0, self._publish_gains)
 
         self._stop = False
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)

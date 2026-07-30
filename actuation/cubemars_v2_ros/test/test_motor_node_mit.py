@@ -395,3 +395,65 @@ def test_uses_standard_not_extended_can_ids(make_node):
     assert node.arb_id == 5
     assert node.reply_id == 5
     assert all(m.is_extended_id is False for m in node.bus.sent)
+
+
+# --------------------- terminal round-trip (live retune) ----------------
+
+
+def test_terminal_style_retune_takes_effect_without_restart(make_node):
+    """What `set_gains 12 1.5` in selqie_terminal must achieve.
+
+    The terminal publishes [kp, kd] on /motorN/set_gains; the node applies it to
+    every subsequent command with no restart. This walks that whole path.
+    """
+    node, mn = make_node(position_kp=5.0, position_kd=0.4)
+
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.5
+
+    # Before: the launch/YAML gains are on the wire.
+    node.on_command(cmd)
+    node._tick()
+    _, _, kp_before, kd_before, _ = _decode(_drive_frames(node)[-1], node.R)
+    assert kp_before == pytest.approx(5.0, abs=0.2)
+
+    # The terminal retunes mid-run...
+    retune = mn.Float64MultiArray()
+    retune.data = [12.0, 1.5]
+    node.on_set_gains(retune)
+
+    # ...and the very next command already carries the new gains.
+    node.on_command(cmd)
+    node._tick()
+    _, _, kp_after, kd_after, _ = _decode(_drive_frames(node)[-1], node.R)
+    assert kp_after == pytest.approx(12.0, abs=0.2)
+    assert kd_after == pytest.approx(1.5, abs=0.01)
+    assert kp_after != kp_before
+
+
+def test_set_gains_can_also_set_velocity_kd(make_node):
+    node, mn = make_node(velocity_kd=0.5)
+    retune = mn.Float64MultiArray()
+    retune.data = [4.0, 0.3, 2.0]        # kp, kd, velocity_kd
+    node.on_set_gains(retune)
+    assert node.velocity_kd == pytest.approx(2.0)
+
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_VELOCITY
+    cmd.vel_setpoint = 5.0
+    node.on_command(cmd)
+    node._tick()
+    _, _, kp, kd, _ = _decode(_drive_frames(node)[-1], node.R)
+    assert kp == 0.0                      # velocity mode still zeroes stiffness
+    assert kd == pytest.approx(2.0, abs=0.01)
+
+
+def test_gains_are_republished_for_late_subscribers(make_node):
+    """The node heartbeats its gains so `gains` in the terminal always has data."""
+    node, _ = make_node()
+    node.published.clear()
+    node._publish_gains()                 # what the 1 Hz timer calls
+    echoed = [m for topic, m in node.published if topic.endswith("/gains")]
+    assert echoed
+    assert len(echoed[-1].data) == 3      # [kp, kd, velocity_kd]

@@ -466,7 +466,8 @@ class SELQIE(Node):
         """Set motor position using the gains configured on the Cubemars launch file."""
         self.send_motor_command(motor_idx, pos, 0.0, 0.0, 0.0, 0.0)
 
-    def set_motor_gains(self, motor_idx : int, kp : float, kd : float, _unused=None):
+    def set_motor_gains(self, motor_idx : int, kp : float, kd : float,
+                        velocity_kd : float | None = None):
         """Set one motor's MIT gains live -- no relaunch, no R-LINK session.
 
         The driver applies, every control cycle:
@@ -475,21 +476,26 @@ class SELQIE(Node):
                    + kd * (vel_setpoint - vel_measured)
                    + torq_setpoint
 
-        so ``kp`` is stiffness and ``kd`` is damping. Protocol ranges are
-        kp 0-500 and kd 0-5; the motor node clips anything outside them. Values
-        set this way are not persisted -- put anything you want to keep in
+        so ``kp`` is stiffness and ``kd`` is damping. ``velocity_kd`` optionally
+        sets the damping used in VELOCITY control mode; omit it to leave that
+        alone. Protocol ranges are kp 0-500 and kd 0-5; the motor node clips
+        anything outside them. Values set this way are not persisted -- put
+        anything you want to keep in
         ``actuation_bringup/config/mit_gains.yaml``.
         """
         if motor_idx < 0 or motor_idx >= self.NUM_MOTORS:
             raise ValueError(f"Motor index {motor_idx} out of range")
         msg = Float64MultiArray()
         msg.data = [float(kp), float(kd)]
+        if velocity_kd is not None:
+            msg.data.append(float(velocity_kd))
         self._motor_gain_publishers[motor_idx].publish(msg)
 
-    def set_all_motor_gains(self, kp : float, kd : float):
+    def set_all_motor_gains(self, kp : float, kd : float,
+                            velocity_kd : float | None = None):
         """Set the MIT gains on every motor at once."""
         for i in range(self.NUM_MOTORS):
-            self.set_motor_gains(i, kp, kd)
+            self.set_motor_gains(i, kp, kd, velocity_kd)
 
     def get_motor_gains(self, motor_idx : int) -> list:
         """Latest gains reported by a motor: ``[kp, kd, velocity_kd]``."""
