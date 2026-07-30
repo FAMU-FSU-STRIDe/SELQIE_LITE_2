@@ -70,10 +70,10 @@ class FakeSelqie:
         self.joy_cb = None
         self.cmd_vels = []
         self.gaits = []
-        self.pos_modes = []
         self.ready_calls = []
         self.idle_calls = []
         self.zero_calls = []
+        self.gain_calls = []
 
     def init(self):
         pass
@@ -98,8 +98,8 @@ class FakeSelqie:
     def set_control_gait(self, gait):
         self.gaits.append(gait)
 
-    def set_all_motors_position_mode(self, mode):
-        self.pos_modes.append(mode)
+    def set_all_motor_gains(self, kp, kd):
+        self.gain_calls.append((kp, kd))
 
     def set_motor_ready(self, i):
         self.ready_calls.append(i)
@@ -151,7 +151,6 @@ def test_ready_enables_and_holds_stand(controller):
     assert jc._ready is True
     assert jc._selected_gait == 'stand'
     assert fake.gaits[-1] == 'stand'
-    assert fake.pos_modes[-1] == 'pos_spd'
     assert fake.cmd_vels[-1] == (0.0, 0.0, 0.0)
 
 
@@ -167,7 +166,6 @@ def test_walk_with_deadman_streams_velocity(controller):
     jc._control_tick()
 
     assert fake.gaits[-1] == 'walk'
-    assert fake.pos_modes[-1] == 'pos'
     lin_x, lin_z, ang_z = fake.cmd_vels[-1]
     assert lin_x == pytest.approx(0.3)   # max_linear default, deadband(1.0)=1.0
     assert lin_z == 0.0                  # walk ignores vertical

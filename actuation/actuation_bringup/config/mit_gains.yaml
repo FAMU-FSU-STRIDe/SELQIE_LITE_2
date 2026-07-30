@@ -1,0 +1,78 @@
+# =============================================================================
+#  CubeMars AK40-10 V2.0 -- MIT mode gains
+#
+#  THIS IS THE ONE FILE TO EDIT WHEN TUNING. Every motor node reads it, so a
+#  change here applies to all 8 motors on the next launch. No rebuild is needed
+#  for a pure YAML edit -- just relaunch (or use the live-tuning topic below to
+#  try values without even that).
+#
+#  The driver closes this loop onboard every control cycle (manual V1.0.18
+#  §5.3):
+#
+#      torque = Kp * (pos_setpoint - pos_measured)
+#             + Kd * (vel_setpoint - vel_measured)
+#             + torq_setpoint
+#
+#  ...then clamps the result to the motor's torque limit. So:
+#    * Kp is stiffness  -- how hard it pulls toward the target position
+#    * Kd is damping    -- resists velocity error, suppresses ringing/overshoot
+#
+#  Protocol limits (quantized into the CAN frame, §5.3):
+#    Kp: 0 - 500     Kd: 0 - 5
+#  Do not exceed these; values are clipped before packing, so anything larger is
+#  silently truncated to the ceiling.
+#
+#  ---------------------------------------------------------------------------
+#  TUNING GUIDE (AK40-10: peak torque 4.1 N.m, so it saturates easily)
+#  ---------------------------------------------------------------------------
+#  Start LOW and work up. At Kp = 20, a mere 0.2 rad position error already
+#  commands 4 N.m and saturates the motor.
+#
+#    Symptom                          Change
+#    -------------------------------  --------------------------------------
+#    Leg sags / lags behind target    raise position_kp
+#    Buzzing, ringing, oscillation    raise position_kd, or lower position_kp
+#    Sluggish, over-damped, mushy     lower position_kd
+#    Harsh, slams into position       lower position_kp AND raise position_kd
+#    Hot motor / torque saturating    lower position_kp
+#
+#  Sensible starting ranges for this motor:
+#    position_kp: 1.0 - 10.0   position_kd: 0.1 - 1.0
+#
+#  ---------------------------------------------------------------------------
+#  LIVE TUNING (no relaunch)
+#  ---------------------------------------------------------------------------
+#    # one motor
+#    ros2 topic pub --once /motor0/set_gains std_msgs/msg/Float64MultiArray \
+#        "{data: [5.0, 0.4]}"          # [kp, kd]
+#
+#    # read back what a motor is currently using
+#    ros2 topic echo /motor0/gains
+#
+#  Live values are NOT persisted -- copy anything you like back into this file.
+# =============================================================================
+
+/**:
+  ros__parameters:
+
+    # ---- POSITION control mode (used by all gaits) ----
+    # The stride generators command positions, so these are the gains that
+    # actually shape gait motion. Tune these first.
+    position_kp: 5.0
+    position_kd: 0.4
+
+    # ---- VELOCITY control mode ----
+    # Position gain is forced to 0 in this mode (there is no position target to
+    # hold), leaving Kd to track the velocity setpoint. Higher = stiffer
+    # velocity tracking.
+    velocity_kd: 0.5
+
+    # ---- TORQUE control mode ----
+    # Pure feed-forward: both gains are 0 so the commanded torque passes
+    # straight through. Listed for completeness; there is nothing to tune.
+
+    # ---- Safety ----
+    # Torque commanded to the motor is clamped to this fraction of the motor's
+    # rated peak (4.1 N.m for AK40-10). Lower it while first bringing gains up
+    # so a bad gain cannot command full torque into a hard stop.
+    torque_limit_scale: 1.0

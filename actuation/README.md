@@ -1,6 +1,12 @@
 # Actuation
 
-Controls all eight CubeMars AK40-10 brushless motors via CAN bus using the CubeMars **Servo Mode** protocol.
+Controls all eight CubeMars AK40-10 V2.0 brushless motors over CAN using the CubeMars **MIT protocol**
+(*AK Series Module Driver Manual* V1.0.18 §5.3).
+
+> **Tuning gains?** Everything you need is in
+> [`actuation_bringup/config/mit_gains.yaml`](actuation_bringup/config/mit_gains.yaml) — one file,
+> all motors, with a symptom→fix table. Gains can also be changed **live** without relaunching:
+> `ros2 topic pub --once /motor0/set_gains std_msgs/msg/Float64MultiArray "{data: [5.0, 0.4]}"`
 
 ---
 
@@ -14,8 +20,9 @@ actuation/
 │       └── cubemars.launch.py  # Launch one motor node
 ├── cubemars_v2_ros/            # Motor driver
 │   └── cubemars_v2_ros/
-│       ├── servo_protocol.py   # Pure servo-mode CAN packing / unit conversion
-│       └── motor_node.py       # ROS 2 node
+│       ├── mit_protocol.py     # MIT-mode CAN packing / unpacking (§5.3)
+│       ├── servo_protocol.py   # Servo-mode protocol (§5.1-5.2), retained
+│       └── motor_node.py       # ROS 2 node (MIT)
 ├── can_bus/                    # Low-level SocketCAN helpers
 ├── actuation_msgs/             # Custom ROS2 message definitions
 └── motor_interfaces/           # Shared motor state message
@@ -23,77 +30,112 @@ actuation/
 
 ---
 
-## Servo Mode Protocol
+## MIT Protocol
 
-The motors run in **Servo Mode** (AK Series Module Driver Manual V1.0.18, §5), **not** the MIT
-protocol. Two consequences drive the whole design:
+The motors are driven with the **MIT ("Mini-Cheetah") protocol** (manual §5.3). The driver also
+speaks a Servo protocol (§5.1–5.2); the decisive difference is where the gains live:
 
-1. **No Kp / Kd.** The position and velocity control loops run *inside the driver* and are
-   configured over R-LINK, not over CAN. No gain is ever transmitted. Each CAN frame commands
-   exactly one quantity.
-2. **Different units.** Servo mode speaks degrees / ERPM / amperes, while the SELQIE leg-control
-   stack speaks radians / rad·s⁻¹ / N·m at the output joint. The node converts between the two so
-   the ROS interface is unchanged — trajectories keep publishing radians.
+| | MIT mode (used here) | Servo mode |
+|---|---|---|
+| Kp / Kd | **sent in every CAN frame** — tunable live from ROS | inside the driver, R-LINK only |
+| CAN ID | standard 11-bit | extended 29-bit |
+| Units | rad, rad/s, N·m (output shaft) | degrees, ERPM, amperes |
+| Command | one frame carries position + velocity + gains + torque | one quantity per frame |
 
-### Servo frames
+Because MIT transmits the gains, retuning is a topic publish rather than a USB session — which is
+why this driver uses it.
 
-All frames are **CAN 2.0 extended (29-bit)**: `CAN ID = (packet_id << 8) | node_id`.
+### Control law
 
-| MotorCommand mode | Servo packet | Command unit | Conversion from ROS units |
-|-------------------|--------------|--------------|---------------------------|
-| `POSITION` (3) | `SET_POS` (4) / `SET_POS_SPD` (6) † | output-shaft degrees × 10000 | `deg = rad × 180/π` |
-| `VELOCITY` (2) | `SET_RPM` (3) | rotor ERPM | `ERPM = rad/s × (60/2π) × gear × pole_pairs` |
-| `TORQUE` (1) | `SET_CURRENT` (1) | phase current × 1000 (mA) | `I = τ / (Kt × gear)` |
+The driver closes this loop onboard every cycle (§5.3 block diagram):
 
-The all-stride trajectory path uses **POSITION** mode, whose conversion is a pure rad↔deg scaling
-(no gear factor — servo position is referenced to the output shaft). Velocity and torque modes
-additionally need the gear ratio, pole pairs, and torque constant listed below.
+```
+torque = Kp × (pos_setpoint − pos_measured)
+       + Kd × (vel_setpoint − vel_measured)
+       + torq_setpoint
+```
 
-† **Position streaming (`pos` vs `pos_spd`).** POSITION mode has two implementations, selected at
-runtime with the `pos`/`pos_spd` special commands (startup default from the `position_mode`
-parameter). The SELQIE UI picks between them by context: **`pos` for all gaits, `pos_spd` only for
-the stand/ready hold.**
+then clamps to the torque limit and hands it to the FOC current loop. So `Kp` is **stiffness**,
+`Kd` is **damping**, and `torq_setpoint` is a feed-forward term. The three ROS control modes are
+just different corners of this one law:
 
-* **`pos` — plain `SET_POS`.** The driver drives to each streamed setpoint using the motor's **full
-  physical acceleration**, so it tracks position accurately at *every* gait frequency — used for all
-  gaits. It is not acceleration-shaped, so a *coarse* setpoint stream would move as a slam-and-wait
-  staircase and can ring; the node streams finely at a high `control_hz` (default **500 Hz**) so the
-  position steps are small and the motion stays smooth.
+| MotorCommand mode | Kp | Kd | Effect |
+|---|---|---|---|
+| `POSITION` (3) | `position_kp` | `position_kd` | Servo to a position with damping |
+| `VELOCITY` (2) | 0 | `velocity_kd` | No position target; track a velocity |
+| `TORQUE` (1) | 0 | 0 | Pure feed-forward torque |
 
-* **`pos_spd` — `SET_POS_SPD` (§5.1.7)** with a velocity feed-forward derived from the change in
-  commanded position over one control period, plus a bounded acceleration. Smooth — used for the
-  gentle stand/ready hold. **Not** used for gaits: its acceleration field is protocol-capped at
-  `pos_spd_accel` ≈ 327670 ERPM/s (~245 rad/s² at the AK40-10 output), and gait acceleration demand
-  grows with frequency *squared*, so above ~1–1.5× base frequency the motor cannot keep up and
-  **positional accuracy is lost**.
+### Frame layout (§5.3)
 
-  In `pos_spd`, the speed feed-forward is clamped to the motor's `V_MAX`, and a held/static setpoint
-  (e.g. the `stand` pose) produces zero feed-forward — so a minimum approach speed
-  (`pos_spd_min_speed`, rad/s) floors the commanded speed, letting held poses and the first move
-  still reach their target. It only binds when the trajectory is (near-)stationary.
+Standard 11-bit IDs, DLC 8, **1 Mbit/s**. Command frames go to the motor ID; replies return on
+`0x00 + drive ID`.
 
-**Why `control_hz` matters.** `run_trajectory` resamples gait files to a constant
-`TRAJECTORY_RESAMPLE_HZ` (default 500 Hz, see `selqie_python.selqie`) regardless of the run
-frequency, so the setpoint stream rate is bounded at any frequency rather than scaling with it — see
-"`run_trajectory` and setpoint resampling" below. The motor node samples the latest setpoint at
-`control_hz`; it should match (or exceed) `TRAJECTORY_RESAMPLE_HZ`, since a lower rate would just
-undersample the resampled stream and reintroduce the staircase/ring problem. Default is **500 Hz**
-on both sides. CAN load at 500 Hz TX + up to 500 Hz status feedback (the driver's upload-rate cap,
-§5.2.1) is ~54% of a 1 Mbps bus with 4 motors, leaving comfortable headroom.
+**Command (host → driver)** — position 16-bit, velocity/Kp/Kd/torque 12-bit each:
 
-> **Notation trap:** servo **position** is output-shaft referenced, but servo **speed** is
-> *rotor-electrical* (ERPM). That asymmetry is why velocity conversion carries a `gear × pole_pairs`
-> factor and position does not.
+| Byte | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| Field | pos[15:8] | pos[7:0] | vel[11:4] | vel[3:0]\|Kp[11:8] | Kp[7:0] | Kd[11:4] | Kd[3:0]\|τ[11:8] | τ[7:0] |
 
-### Feedback (status frame `0x29`)
+**Reply (driver → host):**
 
-| Field | Raw type | Scale | ROS value |
-|-------|----------|-------|-----------|
-| position | int16 | ×0.1 → deg | `pos = deg × π/180` (rad) |
-| speed | int16 | ×10 → ERPM | `vel = ERPM ÷ (gear × pole_pairs) × 2π/60` (rad/s) |
-| current | int16 | ×0.01 → A | `torque = I × Kt × gear` (N·m) |
-| temperature | int8 | °C | °C |
-| error | uint8 | — | 0–7 fault code |
+| Byte | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| Field | drive ID | pos[15:8] | pos[7:0] | vel[11:4] | vel[3:0]\|cur[11:8] | cur[7:0] | temp | error |
+
+> The manual's reply table mislabels bytes 2–4 (it repeats "motor position" three times where speed
+> and current belong). The layout above is what the firmware implements and what the manual's own
+> field widths imply.
+
+Each field is quantized linearly across the motor's configured range, so **the ranges in
+`motor_node.LIMITS` must match the driver's own configuration** — otherwise the motor decodes
+different values than were sent.
+
+### Special commands (§5.3)
+
+Seven `0xFF` bytes followed by a code. **Entering MIT mode is mandatory before any motion command.**
+
+| Code | Meaning | Sent by |
+|---|---|---|
+| `0xFC` | Enter motor control mode | `start` (or `auto_start`) |
+| `0xFD` | Exit motor control mode | `exit`, and on node shutdown |
+| `0xFE` | Set current position to zero | `zero` |
+
+---
+
+## Tuning the gains
+
+**Edit [`actuation_bringup/config/mit_gains.yaml`](actuation_bringup/config/mit_gains.yaml)** — it
+is loaded by every motor node, so one edit covers all 8 motors, and no rebuild is needed for a YAML
+change. It carries the full symptom→fix table inline.
+
+Three ways to set gains, in increasing convenience:
+
+1. **The YAML file** — the durable, shared default.
+2. **Launch overrides** — `ros2 launch ... position_kp:=8.0 position_kd:=0.5` (blank = use the YAML).
+3. **Live, mid-run** — no relaunch:
+   ```bash
+   ros2 topic pub --once /motor0/set_gains std_msgs/msg/Float64MultiArray "{data: [5.0, 0.4]}"
+   ros2 topic echo /motor0/gains        # read back what a motor is using
+   ```
+   Live values are **not** persisted — copy anything you like back into the YAML.
+
+Quick reference:
+
+| Symptom | Change |
+|---|---|
+| Leg sags / lags behind target | raise `position_kp` |
+| Buzzing, ringing, oscillation | raise `position_kd`, or lower `position_kp` |
+| Sluggish, over-damped | lower `position_kd` |
+| Harsh, slams into position | lower `position_kp` **and** raise `position_kd` |
+| Motor hot / torque saturating | lower `position_kp` |
+
+**Start low.** The AK40-10 peaks at 4.1 N·m, so at `Kp = 20` a mere 0.2 rad error already saturates
+the motor. Sensible starting ranges: `position_kp` 1–10, `position_kd` 0.1–1.0. Protocol ceilings
+are `Kp ≤ 500`, `Kd ≤ 5`; anything larger is clipped before packing.
+
+`torque_limit_scale` (0–1) shrinks the commanded torque range — useful while first bringing gains
+up, so a bad gain cannot command full torque into a hard stop. It also improves the 12-bit torque
+resolution over the reduced range.
 
 ---
 
@@ -166,23 +208,29 @@ The `leg_trajectory_publisher` C++ node polls at 1000 Hz and advances to whateve
 
 ## Supported Motor Types
 
-| Model | V_MAX (rad/s) | T_MAX (Nm) | Gear | Pole pairs | Kt (Nm/A) |
-|-------|--------------|------------|------|-----------|-----------|
-| AK10-9 | ±50 | ±65 | 9 | 21 | 0.198 |
-| AK40-10 | ±45.5 | ±4.1 | 10 | 14 † | 0.056 |
-| AK60-6 | ±45 | ±15 | 6 | 14 | — |
-| AK70-10 | ±50 | ±25 | 10 | 21 | 0.123 |
-| AK80-6 | ±76 | ±12 | 6 | 21 | — |
-| AK80-8 | ±37.5 | ±32 | 8 | 21 | — |
-| AK80-9 | ±50 | ±18 | 9 | 21 | — |
-| AK80-64 | ±9.2 | ±144 | 64 | 21 | 0.136 |
+These are the ranges the MIT frame quantizes against (`motor_node.LIMITS`). **They must match the
+driver's own configuration** — if they disagree, the motor decodes different values than were sent.
 
-SELQIE Lite 2 uses **AK40-10** motors exclusively. † The AK40-10 row is datasheet-verified
-(24 slots / 14 pole pairs, KT 0.056 Nm/A, 10:1, 4.1 Nm peak torque = 7.3 A peak current). Pole-pair
-values for the other models are best-guess (21 is common for the AK series) and only affect
-VELOCITY-mode scaling — verify them against your motors and override with the `pole_pairs` parameter.
-If a torque constant or gear ratio for a given model is missing above, torque/velocity conversion
-falls back to a safe default (current 0 / gear 1).
+| Model | P (rad) | V_MAX (rad/s) | T_MAX (N·m) | Gear | Kt (N·m/A) |
+|-------|---------|--------------|-------------|------|-----------|
+| AK10-9 | ±12.5 | ±50 | ±65 | 9 | 0.16 |
+| AK40-10 † | ±12.5 | ±45.5 | ±4.1 | 10 | 0.056 |
+| AK60-6 | ±12.5 | ±45 | ±15 | 6 | — |
+| AK70-10 | ±12.5 | ±50 | ±25 | 10 | 0.123 |
+| AK80-6 | ±12.5 | ±76 | ±12 | 6 | — |
+| AK80-8 | ±12.5 | ±37.5 | ±32 | 8 | — |
+| AK80-9 | ±12.5 | ±50 | ±18 | 9 | — |
+| AK80-64 | ±12.5 | ±8 | ±144 | 64 | 0.136 |
+
+Kp is always 0–500 and Kd 0–5 (fixed by the protocol, §5.3).
+
+SELQIE Lite 2 uses **AK40-10 V2.0** motors exclusively. † That row is datasheet-verified: 24 slots /
+14 pole pairs, KT 0.056 N·m/A, 10:1 reduction, 4.1 N·m peak torque (= 7.3 A peak current, which the
+two figures corroborate), and 435 rpm no-load = 45.5 rad/s at the output.
+
+Gear ratio and Kt are used **only to report phase current** alongside torque — MIT mode commands
+torque directly, so unlike servo mode neither value affects what is actually commanded. Pole pairs
+are not needed at all in MIT mode.
 
 ---
 
@@ -195,13 +243,15 @@ falls back to a safe default (current 0 / gear 1).
 | `/{joint}/motor_state` | `MotorState` | Full feedback at the driver's upload rate |
 | `/{joint}/estimate` | `MotorEstimate` | Position/velocity/torque for kinematics |
 | `/{joint}/error_code` | `String` | Fault code with human-readable message |
+| `/{joint}/gains` | `Float64MultiArray` | Currently active `[position_kp, position_kd, velocity_kd]` |
 
 ### Subscribers
 
 | Topic | Type | Description |
 |-------|------|-------------|
 | `/{joint}/command` | `MotorCommand` | High-level command (position/velocity/torque mode) |
-| `/{joint}/servo_cmd` | `Float64MultiArray` | Raw bench command `[mode, value]` (legacy 5-tuple accepted; gains ignored) |
+| `/{joint}/mit_cmd` | `Float64MultiArray` | Raw bench command `[p, v, kp, kd, τ]` |
+| `/{joint}/set_gains` | `Float64MultiArray` | Live gain override `[kp, kd]` (or `[kp, kd, velocity_kd]`) |
 | `/{joint}/special_cmd` | `String` | `"start"`, `"exit"`, `"zero"`, `"clear"` |
 
 ### Message Definitions
@@ -242,30 +292,22 @@ float32 torq_estimate  # Nm
 | `motor_id` / `can_id` | `0` | CAN node ID (0–7) |
 | `motor_type` | `AK40-10` | Motor model string |
 | `interface` / `can_interface` | `can0` | SocketCAN interface name |
-| `control_hz` | `500.0` | Setpoint stream / command rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
-| `pole_pairs` | `0` | Rotor pole pairs for ERPM scaling (`0` = per-motor table default) |
-| `gear_ratio` | `0.0` | Gear reduction for ERPM/torque scaling (`0` = per-motor table default) |
-| `position_mode` | `pos_spd` | Startup POSITION submode: `pos_spd` (feed-forward, smooth) or `pos` (plain SET_POS, accurate at all freq). Switchable at runtime via the `pos`/`pos_spd` special commands |
-| `pos_spd_accel` | `327670.0` | Acceleration limit (ERPM/s) for `pos_spd` streaming (protocol max) |
-| `pos_spd_min_speed` | `2.0` | Minimum approach speed (rad/s) for `pos_spd`; lets held poses (stand) reach their target |
+| `control_hz` | `500.0` | MIT frame rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
+| `position_kp` | `5.0` | POSITION-mode stiffness (0–500). From `mit_gains.yaml` |
+| `position_kd` | `0.4` | POSITION-mode damping (0–5). From `mit_gains.yaml` |
+| `velocity_kd` | `0.5` | VELOCITY-mode damping (0–5). From `mit_gains.yaml` |
+| `torque_limit_scale` | `1.0` | Scale the commanded torque range (0–1) |
 | `reverse_polarity` | `false` | Negate position/velocity/torque |
 | `cmd_timeout` | `0.5` | Seconds before a stale command releases the motor (0 = disabled) |
-| `auto_start` | `false` | Enable motor on node startup |
+| `auto_start` | `false` | Enter MIT mode on node startup |
 
-There are **no gain parameters** — servo mode has no Kp/Kd. Tune the position/velocity loops in the
-R-LINK upper computer instead.
+Gains come from `mit_gains.yaml` unless a launch argument overrides them — see
+[Tuning the gains](#tuning-the-gains).
 
----
-
-## Tuning
-
-Servo-mode loop gains are configured in the **R-LINK upper computer**, not in ROS. The launch files
-carry no gain constants. `selqie_bringup/launch/actuation.launch.py` only maps motor IDs to CAN
-interfaces and (optionally) sets `reverse_polarity` per shaft group.
-
-> **Note:** `InnerShaft()`/`OuterShaft()` both currently launch with `reverse_polarity='false'`.
-> As written, no motor launches with reversed polarity — polarity is handled inside the five-bar
-> kinematics. Confirm this before relying on the "inner/outer" language elsewhere.
+> **Note:** `InnerShaft()`/`OuterShaft()` in `selqie_bringup/launch/actuation.launch.py` both
+> currently launch with `reverse_polarity='false'`. As written, no motor launches with reversed
+> polarity — polarity is handled inside the five-bar kinematics. Confirm this before relying on the
+> "inner/outer" language elsewhere.
 
 ---
 
@@ -275,12 +317,11 @@ interfaces and (optionally) sets `reverse_polarity` per shaft group.
 that window the motor node:
 
 1. Sets `_neutral_hold = true`
-2. Sends a zero-current frame so the motor produces no torque (releases)
+2. Sends an all-zero MIT frame (Kp = Kd = τ = 0), so the motor produces no torque
 3. Logs a warning
 
 Set `cmd_timeout: 0.0` to disable (not recommended for hardware runs). Note that on a legged robot,
-releasing torque means the leg goes limp — the same behaviour the MIT node had when it sent all
-zeros.
+zero gains mean the leg goes limp.
 
 ---
 
@@ -311,15 +352,10 @@ Send a string to `/{joint}/special_cmd`:
 
 | Command | Effect |
 |---------|--------|
-| `start` | Enable command output (must be sent before motion commands) |
-| `exit` | Release the motor (zero current) and stop driving it |
-| `zero` | Set the current position as the (temporary) origin |
-| `clear` | Neutral hold — release torque until a new command arrives |
-| `pos` | Switch POSITION streaming to plain `SET_POS` (accurate; used for all gaits) |
-| `pos_spd` | Switch POSITION streaming to `SET_POS_SPD` (smooth; used for the stand/ready hold) |
-
-The SELQIE UI drives `pos`/`pos_spd` automatically: `run_trajectory` selects `pos` for the gait and
-returns to `pos_spd` when the run completes; `ready` and `stand` select `pos_spd` for the held pose.
+| `start` | Enter MIT mode (`0xFC`) — **required before any motion command** |
+| `exit` | Exit MIT mode (`0xFD`) and release the motor |
+| `zero` | Set the current position as zero (`0xFE`); goes limp first so the origin is never redefined under load |
+| `clear` | Neutral hold — zero gains and torque until a new command arrives |
 
 Example:
 ```bash
@@ -334,6 +370,7 @@ Pure-protocol and node-level command conversion are covered by unit tests that n
 a CAN bus:
 
 ```bash
-python3 -m pytest actuation/cubemars_v2_ros/test/test_servo_protocol.py \
-                  actuation/cubemars_v2_ros/test/test_motor_node_servo.py
+python3 -m pytest actuation/cubemars_v2_ros/test/test_mit_protocol.py \
+                  actuation/cubemars_v2_ros/test/test_motor_node_mit.py \
+                  actuation/cubemars_v2_ros/test/test_servo_protocol.py
 ```

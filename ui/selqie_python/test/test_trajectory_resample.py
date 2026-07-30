@@ -67,6 +67,7 @@ def _install_stubs():
 
     std_msgs = _msg_module('std_msgs.msg', {
         'Bool': dict(data=False), 'Empty': dict(), 'Float32': dict(data=0.0),
+        'Float64MultiArray': dict(data=list),
         'String': dict(data=""), 'UInt32MultiArray': dict(data=[]),
     })
     sys.modules['std_msgs'] = types.ModuleType('std_msgs')

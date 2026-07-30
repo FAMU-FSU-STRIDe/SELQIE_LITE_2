@@ -48,9 +48,6 @@ class SELQIETerminal(Cmd):
         """ Ready the Cubemars motors """
         for i in range(self._selqie.NUM_MOTORS):
             self._selqie.set_motor_ready(i)
-        # The ready/stand move is a gentle hold -> use the smooth position-speed
-        # submode. Gaits switch to plain position per their frequency below.
-        self._selqie.set_all_motors_position_mode('pos_spd')
 
     def do_clear_errors(self, line : str):
         """ Clear errors on the Cubemars motors """
@@ -75,14 +72,14 @@ class SELQIETerminal(Cmd):
             print("Invalid motor or position values")
 
     def do_set_gains(self, line : str):
-        """ Set the gains for the motors: set_gains <p_gain> <v_gain> """
+        """ Set MIT gains on all motors, live: set_gains <kp> <kd> """
         args = line.split()
         if len(args) != 2:
-            print("Usage: set_gains <p_gain> <v_gain>")
+            print("Usage: set_gains <kp> <kd>   (kp 0-500 stiffness, kd 0-5 damping)")
             return
         try:
-            for i in range(self._selqie.NUM_MOTORS):
-                self._selqie.set_motor_gains(i, float(args[0]), float(args[1]))
+            self._selqie.set_all_motor_gains(float(args[0]), float(args[1]))
+            print(f"Set gains on all motors: kp={args[0]} kd={args[1]}")
         except ValueError:
             print("Invalid gain values")
 
@@ -158,9 +155,8 @@ class SELQIETerminal(Cmd):
 
         # Wait out the run. This is progress reporting only -- the publisher is
         # already executing the whole sequence on its own clock -- but it must
-        # not return early, or the caller's cleanup (switching back to the
-        # pos_spd stand submode) would fire while the stride is still playing.
-        # Playback begins one start-delay after the publish, so include it.
+        # not return early, or the caller would move on while the stride is
+        # still playing. Playback begins one start-delay after the publish.
         start = time.monotonic() + self._selqie.TRAJECTORY_START_DELAY
         for loop_idx in range(num_loops):
             print(f"  Loop {loop_idx+1}/{num_loops}")
@@ -175,10 +171,6 @@ class SELQIETerminal(Cmd):
             print("Usage: run_trajectory <file1> <num_loops1> <frequency1> <file2> <num_loops2> <frequency2> ...")
             return
         try:
-            # Gaits run in plain position (SET_POS) for accurate tracking at any
-            # frequency; only the stand/ready hold uses the position-speed submode.
-            self._selqie.set_all_motors_position_mode('pos')
-            time.sleep(0.05)  # let the mode change take effect before streaming
             for seg in range(0, len(args), 3):
                 file = args[seg]
                 num_loops = int(args[seg+1])
@@ -201,10 +193,6 @@ class SELQIETerminal(Cmd):
             print("Invalid number of loops or frequency")
         except FileNotFoundError:
             print("File not found")
-        finally:
-            # Return to the smooth submode for the stand/return-to-ready move that
-            # follows a completed gait.
-            self._selqie.set_all_motors_position_mode('pos_spd')
             
     def complete_run_trajectory(self, text, line, begidx, endidx):
         """ Autocomplete for run_trajectory """
@@ -408,8 +396,6 @@ class SELQIETerminal(Cmd):
 
     def do_stand(self, line : str):
         """ Stand the robot """
-        # Standing is a held pose -> smooth position-speed submode.
-        self._selqie.set_all_motors_position_mode('pos_spd')
         self._selqie.set_control_gait('stand')
         time.sleep(0.1)
         self._selqie.set_control_command_velocity(0.0, 0.0, 0.0)

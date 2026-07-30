@@ -1,7 +1,16 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+# Single place to tune Kp/Kd for every motor. Launch arguments below override
+# anything set here, and gains can also be changed live at runtime by
+# publishing to /motorN/set_gains -- see the file itself for the tuning guide.
+MIT_GAINS_FILE = os.path.join(
+    get_package_share_directory('actuation_bringup'), 'config', 'mit_gains.yaml')
 
 
 def launch_setup(context, *args, **kwargs):
@@ -10,15 +19,34 @@ def launch_setup(context, *args, **kwargs):
     motor_type = LaunchConfiguration('motor_type').perform(context)
     control_hz = LaunchConfiguration('control_hz').perform(context)
     auto_start = LaunchConfiguration('auto_start').perform(context)
-    pole_pairs = LaunchConfiguration('pole_pairs').perform(context)
-    gear_ratio = LaunchConfiguration('gear_ratio').perform(context)
-    position_mode = LaunchConfiguration('position_mode').perform(context)
-    pos_spd_accel = LaunchConfiguration('pos_spd_accel').perform(context)
-    pos_spd_min_speed = LaunchConfiguration('pos_spd_min_speed').perform(context)
     cmd_timeout = LaunchConfiguration('cmd_timeout').perform(context)
     reverse_polarity = LaunchConfiguration('reverse_polarity').perform(context)
+    position_kp = LaunchConfiguration('position_kp').perform(context)
+    position_kd = LaunchConfiguration('position_kd').perform(context)
+    velocity_kd = LaunchConfiguration('velocity_kd').perform(context)
+    torque_limit_scale = LaunchConfiguration('torque_limit_scale').perform(context)
 
     joint_name = f'motor{motor_id}'
+
+    # Start from the shared gains file, then apply any per-launch overrides.
+    overrides = {
+        'can_interface': interface,
+        'can_id': int(motor_id),
+        'motor_type': motor_type,
+        'control_hz': float(control_hz),
+        'joint_name': joint_name,
+        'auto_start': auto_start.lower() in ('true', '1', 'yes'),
+        'cmd_timeout': float(cmd_timeout),
+        'reverse_polarity': reverse_polarity.lower() in ('true', '1', 'yes'),
+    }
+    # Only override a gain when it was actually given, so the YAML stays the
+    # single source of truth unless someone deliberately overrides it.
+    for name, value in (('position_kp', position_kp),
+                        ('position_kd', position_kd),
+                        ('velocity_kd', velocity_kd),
+                        ('torque_limit_scale', torque_limit_scale)):
+        if value != '':
+            overrides[name] = float(value)
 
     return [
         Node(
@@ -26,21 +54,7 @@ def launch_setup(context, *args, **kwargs):
             executable='motor_node',
             name=f'{joint_name}_node',
             output='screen',
-            parameters=[{
-                'can_interface': interface,
-                'can_id': int(motor_id),
-                'motor_type': motor_type,
-                'control_hz': float(control_hz),
-                'joint_name': joint_name,
-                'auto_start': auto_start.lower() in ('true', '1', 'yes'),
-                'pole_pairs': int(pole_pairs),
-                'gear_ratio': float(gear_ratio),
-                'position_mode': position_mode,
-                'pos_spd_accel': float(pos_spd_accel),
-                'pos_spd_min_speed': float(pos_spd_min_speed),
-                'cmd_timeout': float(cmd_timeout),
-                'reverse_polarity': reverse_polarity.lower() in ('true', '1', 'yes'),
-            }],
+            parameters=[MIT_GAINS_FILE, overrides],
         ),
     ]
 
@@ -59,49 +73,40 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'control_hz',
             default_value='500.0',
-            description='Control loop / setpoint stream rate in Hz. Higher = finer, smoother '
-                        'position streaming for plain SET_POS. Matches selqie_python\'s '
-                        'TRAJECTORY_RESAMPLE_HZ so run_trajectory setpoints are not '
-                        'undersampled at the motor node.',
+            description='Rate (Hz) at which MIT command frames are sent.',
         ),
         DeclareLaunchArgument(
-            'auto_start', default_value='false', description='Enable motor automatically.'
-        ),
-        DeclareLaunchArgument(
-            'pole_pairs',
-            default_value='0',
-            description='Rotor pole pairs for ERPM (velocity) scaling. 0 = per-motor default.',
-        ),
-        DeclareLaunchArgument(
-            'gear_ratio',
-            default_value='0.0',
-            description='Gearbox reduction for ERPM/torque scaling. 0 = per-motor default.',
-        ),
-        DeclareLaunchArgument(
-            'position_mode',
-            default_value='pos_spd',
-            description="Startup POSITION streaming: 'pos_spd' (feed-forward, smooth) or 'pos' "
-                        "(plain). Switchable at runtime via the pos/pos_spd special commands.",
-        ),
-        DeclareLaunchArgument(
-            'pos_spd_accel',
-            default_value='327670.0',
-            description='Acceleration limit (ERPM/s) for pos_spd streaming; protocol max ~327670.',
-        ),
-        DeclareLaunchArgument(
-            'pos_spd_min_speed',
-            default_value='2.0',
-            description='Minimum approach speed (rad/s) for pos_spd so held poses (stand) move.',
+            'auto_start',
+            default_value='false',
+            description='Enter MIT mode automatically on startup.',
         ),
         DeclareLaunchArgument(
             'cmd_timeout',
             default_value='0.5',
-            description='Seconds without a command before motor is released (0 = disabled).',
+            description='Seconds without a command before the motor is released '
+                        '(0 = disabled).',
         ),
         DeclareLaunchArgument(
             'reverse_polarity',
             default_value='false',
             description='Invert motor direction (true for inner shafts).',
+        ),
+        # Gain overrides. Empty means "use the value from mit_gains.yaml".
+        DeclareLaunchArgument(
+            'position_kp', default_value='',
+            description='Override POSITION-mode Kp (stiffness). Blank = use mit_gains.yaml.',
+        ),
+        DeclareLaunchArgument(
+            'position_kd', default_value='',
+            description='Override POSITION-mode Kd (damping). Blank = use mit_gains.yaml.',
+        ),
+        DeclareLaunchArgument(
+            'velocity_kd', default_value='',
+            description='Override VELOCITY-mode Kd. Blank = use mit_gains.yaml.',
+        ),
+        DeclareLaunchArgument(
+            'torque_limit_scale', default_value='',
+            description='Scale the commanded torque limit (0-1). Blank = use mit_gains.yaml.',
         ),
         OpaqueFunction(function=launch_setup),
     ])
