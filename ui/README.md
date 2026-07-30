@@ -52,7 +52,9 @@ Type `help` at the prompt to list all commands. Type `help <command>` for detail
 | `zero` | — | Call `set_motor_position_zero` on all motors (sets current position as encoder zero — does not move the motor) |
 | `clear_errors` | — | Send `"clear"` to all motors |
 | `set_motor_position` | `<motor_id 0-7> <pos_rad>` | Command one motor to a position |
-| `set_gains` | `<kp> <kd>` | **No-op.** Logs a warning and does nothing — CubeMars gains are fixed per-motor in `selqie_bringup/launch/actuation.launch.py` and only change on relaunch. Kept for command-set compatibility with the predecessor (ODrive-based) robot. |
+| `set_gains` | `<kp> <kd> [velocity_kd]` | Set MIT gains on **all** motors, live — takes effect on the next command, no node restart. `kp` 0–500 (stiffness), `kd` 0–5 (damping). |
+| `set_motor_gains` | `<motor> <kp> <kd> [velocity_kd]` | Same, for a single motor. |
+| `gains` | — | Print the gains every motor is currently using. |
 | `default` | — | Move all 4 legs to the default stance position (`0, 0, -0.18914`) |
 | `set_leg_position` | `<leg\|*> <x> <y> <z>` | Move one leg (`FL`/`RL`/`RR`/`FR`) or all (`*`) to a Cartesian foot position (m) |
 | `set_leg_force` | `<leg\|*> <x> <y> <z>` | Command one leg or all to a Cartesian foot force (N) |
@@ -64,7 +66,7 @@ Type `help` at the prompt to list all commands. Type `help <command>` for detail
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `run_trajectory` | `<file> <loops> <hz> [<file2> <loops2> <hz2> ...]` | Play one or more trajectory files open-loop. Tab-completes filenames from `leg_trajectory_publisher/trajectories/`. Each file is resampled to a constant setpoint rate (`TRAJECTORY_RESAMPLE_HZ`, default 1000 Hz) regardless of `<hz>`, so the delivered rate stays within the CAN/motor-node budget instead of scaling with frequency — see [Actuation](../actuation/README.md#run_trajectory-and-setpoint-resampling). |
+| `run_trajectory` | `<file> <loops> <hz> [<file2> <loops2> <hz2> ...]` | Play one or more trajectory files open-loop. Tab-completes filenames from `leg_trajectory_publisher/trajectories/`. Each file is resampled to a constant setpoint rate (`TRAJECTORY_RESAMPLE_HZ`, default 500 Hz) regardless of `<hz>`, so the delivered rate stays within the CAN/motor-node budget instead of scaling with frequency — see [Actuation](../actuation/README.md#run_trajectory-and-setpoint-resampling). |
 | `run_trajectory_record` | same as above | Same as `run_trajectory`, but automatically starts a rosbag before the run and stops it after. Refuses to start if already recording. |
 
 ### Closed-Loop Gait Commands
@@ -150,7 +152,9 @@ robot.set_motor_idle(motor_idx)           # Send "exit" — disable one motor
 robot.set_motor_position_zero(motor_idx)  # Zero one motor's encoder
 robot.set_motor_clear_errors(motor_idx)   # Clear one motor's fault state
 robot.set_motor_position(motor_idx, pos_rad)
-robot.set_motor_gains(motor_idx, p_gain, v_gain, v_int_gain=None)  # No-op; logs a warning. Gains are launch-file parameters.
+robot.set_motor_gains(motor_idx, kp, kd, velocity_kd=None)  # Live MIT gain change, no restart
+robot.set_all_motor_gains(kp, kd, velocity_kd=None)         # Same, every motor
+robot.get_motor_gains(motor_idx)                            # -> [kp, kd, velocity_kd]
 robot.get_motor_estimate(motor_idx)       # Returns MotorState for that motor
 robot.get_motor_error_name(motor_idx)     # Returns the latest error string
 ```

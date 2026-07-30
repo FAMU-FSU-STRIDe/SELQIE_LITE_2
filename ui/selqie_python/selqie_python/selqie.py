@@ -12,7 +12,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 
-from std_msgs.msg import Bool, Empty, Float32, String, UInt32MultiArray
+from std_msgs.msg import Bool, Empty, Float32, Float64MultiArray, String, UInt32MultiArray
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped, Quaternion, Vector3
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, Imu
@@ -224,8 +224,10 @@ class SELQIE(Node):
         self._motor_position_gains = [list(self.DEFAULT_MOTOR_GAINS) for _ in range(self.NUM_MOTORS)]
         self._motor_cmd_publishers = []
         self._motor_special_publishers = []
+        self._motor_gain_publishers = []
         self._motor_states = [MotorState() for _ in range(self.NUM_MOTORS)]
         self._motor_errors = [String() for _ in range(self.NUM_MOTORS)]
+        self._motor_gains = [Float64MultiArray() for _ in range(self.NUM_MOTORS)]
 
         for i in range(self.NUM_MOTORS):
             self._motor_cmd_publishers.append(
@@ -233,6 +235,15 @@ class SELQIE(Node):
             )
             self._motor_special_publishers.append(
                 self.create_publisher(String, f'/motor{i}/special_cmd', QOS_RELIABLE())
+            )
+            # MIT gains are settable at runtime; see set_motor_gains().
+            self._motor_gain_publishers.append(
+                self.create_publisher(Float64MultiArray, f'/motor{i}/set_gains', QOS_RELIABLE())
+            )
+
+            motor_gains_callback = lambda msg, i=i: self._motor_gains.__setitem__(i, msg)
+            self.create_subscription(
+                Float64MultiArray, f'/motor{i}/gains', motor_gains_callback, QOS_RELIABLE()
             )
 
             motor_state_callback = lambda msg, i=i: self._motor_states.__setitem__(i, msg)
@@ -438,21 +449,6 @@ class SELQIE(Node):
         """Set the motor's current Cubemars encoder position to zero."""
         self.send_motor_special_command(motor_idx, 'zero')
 
-    def set_motor_position_mode(self, motor_idx : int, mode : str):
-        """Select the motor's POSITION streaming submode ('pos' or 'pos_spd')."""
-        if mode not in ('pos', 'pos_spd'):
-            raise ValueError(f"position mode must be 'pos' or 'pos_spd', got {mode!r}")
-        self.send_motor_special_command(motor_idx, mode)
-
-    def set_all_motors_position_mode(self, mode : str):
-        """Select the POSITION streaming submode on every motor.
-
-        Use 'pos_spd' (smooth) for slow gaits (<1 Hz) and stand/ready holds, and
-        'pos' (accurate at every frequency) for faster gaits.
-        """
-        for i in range(self.NUM_MOTORS):
-            self.set_motor_position_mode(i, mode)
-
     def send_motor_command(self, motor_idx : int, position : float, velocity : float, kp : float, kd : float, torque : float):
         """Send a Cubemars MotorCommand; gains are owned by the motor launch file."""
         if motor_idx < 0 or motor_idx >= self.NUM_MOTORS:
@@ -470,19 +466,42 @@ class SELQIE(Node):
         """Set motor position using the gains configured on the Cubemars launch file."""
         self.send_motor_command(motor_idx, pos, 0.0, 0.0, 0.0, 0.0)
 
-    def set_motor_gains(self, motor_idx : int, p_gain : float, v_gain : float, v_int_gain : float | None = None):
-        """Leave motor gains unchanged; Cubemars gains are launch-file parameters."""
-        if motor_idx < 0 or motor_idx >= self.NUM_MOTORS:
-            raise ValueError(f"Motor index {motor_idx} out of range")
-        _ = (p_gain, v_gain, v_int_gain)
-        self.get_logger().warn(
-            "Ignoring set_motor_gains(); Cubemars position/velocity gains are configured in actuation_bringup/launch/cubemars.launch.py"
-        )
+    def set_motor_gains(self, motor_idx : int, kp : float, kd : float,
+                        velocity_kd : float | None = None):
+        """Set one motor's MIT gains live -- no relaunch, no R-LINK session.
 
-    def set_motor_gains_default(self, motor_idx : int):
-        """Leave motor gains unchanged; launch-file gains remain in effect."""
+        The driver applies, every control cycle:
+
+            torque = kp * (pos_setpoint - pos_measured)
+                   + kd * (vel_setpoint - vel_measured)
+                   + torq_setpoint
+
+        so ``kp`` is stiffness and ``kd`` is damping. ``velocity_kd`` optionally
+        sets the damping used in VELOCITY control mode; omit it to leave that
+        alone. Protocol ranges are kp 0-500 and kd 0-5; the motor node clips
+        anything outside them. Values set this way are not persisted -- put
+        anything you want to keep in
+        ``actuation_bringup/config/mit_gains.yaml``.
+        """
         if motor_idx < 0 or motor_idx >= self.NUM_MOTORS:
             raise ValueError(f"Motor index {motor_idx} out of range")
+        msg = Float64MultiArray()
+        msg.data = [float(kp), float(kd)]
+        if velocity_kd is not None:
+            msg.data.append(float(velocity_kd))
+        self._motor_gain_publishers[motor_idx].publish(msg)
+
+    def set_all_motor_gains(self, kp : float, kd : float,
+                            velocity_kd : float | None = None):
+        """Set the MIT gains on every motor at once."""
+        for i in range(self.NUM_MOTORS):
+            self.set_motor_gains(i, kp, kd, velocity_kd)
+
+    def get_motor_gains(self, motor_idx : int) -> list:
+        """Latest gains reported by a motor: ``[kp, kd, velocity_kd]``."""
+        if motor_idx < 0 or motor_idx >= self.NUM_MOTORS:
+            raise ValueError(f"Motor index {motor_idx} out of range")
+        return list(self._motor_gains[motor_idx].data)
 
     def get_motor_info(self, motor_idx : int) -> String:
         """Get the latest motor error/status string message."""

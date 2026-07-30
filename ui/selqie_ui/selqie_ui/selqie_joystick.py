@@ -53,10 +53,6 @@ _VERTICAL_GAITS = ('swim', 'jump')   # use lin_x + lin_z
 _STATIC_GAITS = ('stand', 'sink')    # zero cmd_vel (the gait itself does the work)
 _ALL_GAITS = (_STEER_GAIT,) + _VERTICAL_GAITS + _STATIC_GAITS
 
-# Position streaming submode per gait (matches selqie_terminal): the held stand
-# pose uses the smooth position-speed submode, moving gaits use plain position.
-_POS_SPD_GAITS = ('stand',)
-
 
 class SELQIEJoystick:
     """Joystick front-end that drives the shared SELQIE interface."""
@@ -173,7 +169,6 @@ class SELQIEJoystick:
             self._selqie.set_motor_ready(i)
         self._ready = True
         self._selected_gait = 'stand'
-        self._selqie.set_all_motors_position_mode('pos_spd')
         self._selqie.set_control_gait('stand')
         self._selqie.set_control_command_velocity(0.0, 0.0, 0.0)
         self._effective_gait = 'stand'
@@ -238,9 +233,7 @@ class SELQIEJoystick:
         return 0.0, 0.0, 0.0                    # stand, sink
 
     def _publish_gait(self, gait: str):
-        """Publish a gait change and set the matching position submode."""
-        mode = 'pos_spd' if gait in _POS_SPD_GAITS else 'pos'
-        self._selqie.set_all_motors_position_mode(mode)
+        """Publish a gait change."""
         self._selqie.set_control_gait(gait)
         self._effective_gait = gait
 
