@@ -12,6 +12,8 @@
   <depend>rclcpp</depend>
   <depend>actuation_msgs</depend>
   <depend>leg_control_msgs</depend>
+  <depend>motor_interfaces</depend>
+  <depend>std_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

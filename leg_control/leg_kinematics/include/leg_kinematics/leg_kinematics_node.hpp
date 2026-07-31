@@ -8,6 +8,8 @@
 // Headers for custom ROS messages
 #include <actuation_msgs/msg/motor_command.hpp>
 #include <actuation_msgs/msg/motor_estimate.hpp>
+#include <motor_interfaces/msg/motor_state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <leg_control_msgs/msg/leg_command.hpp>
 #include <leg_control_msgs/msg/leg_estimate.hpp>
 
@@ -15,6 +17,8 @@
 using namespace Eigen;
 using namespace actuation_msgs::msg;
 using namespace leg_control_msgs::msg;
+using MotorState = motor_interfaces::msg::MotorState;
+using Float64MultiArray = std_msgs::msg::Float64MultiArray;
 
 /*
  * Fast Quality of Service Protocol
@@ -98,12 +102,17 @@ private:
     rclcpp::Subscription<LegCommand>::SharedPtr _leg_command_sub; // Subscription for leg commands
     rclcpp::Publisher<LegEstimate>::SharedPtr _leg_estimate_pub;  // Publisher for leg estimates
 
-    std::vector<rclcpp::Subscription<MotorEstimate>::SharedPtr> _motor_estimate_subs; // Subscriptions for motor estimates
-    std::vector<rclcpp::Publisher<MotorCommand>::SharedPtr> _motor_command_pubs;      // Publishers for motor commands
+    std::vector<rclcpp::Subscription<MotorEstimate>::SharedPtr> _motor_estimate_subs; // Subscriptions for legacy motor estimates
+    std::vector<rclcpp::Subscription<MotorState>::SharedPtr> _motor_state_subs;        // Subscriptions for CubeMars motor states
+    std::vector<rclcpp::Publisher<MotorCommand>::SharedPtr> _motor_command_pubs;       // Publishers for legacy motor commands
+    std::vector<rclcpp::Publisher<Float64MultiArray>::SharedPtr> _motor_mit_cmd_pubs;   // Publishers for CubeMars MIT commands
 
     rclcpp::TimerBase::SharedPtr _motor_estimate_timer; // Timer for periodic leg estimate updates
 
     std::vector<MotorEstimate> _latest_motor_estimates; // Stores the latest motor estimates
+
+    double _motor_kp; // CubeMars MIT position gain
+    double _motor_kd; // CubeMars MIT velocity gain
 
     /*
      * Get the latest motor positions in vector form from the stored motor estimate messages
@@ -148,6 +157,43 @@ private:
         return torques;
     }
 
+    bool _requires_jacobian(const LegCommand &msg) const
+    {
+        const Vector3f vel_setpoint = fromVector3(msg.vel_setpoint);
+        const Vector3f force_setpoint = fromVector3(msg.force_setpoint);
+        return msg.control_mode != LegCommand::CONTROL_MODE_POSITION ||
+               vel_setpoint.squaredNorm() > 0.0f ||
+               force_setpoint.squaredNorm() > 0.0f;
+    }
+
+    void _publish_motor_commands(
+        const LegCommand &msg,
+        const std::size_t motor_idx,
+        const float motor_pos,
+        const float motor_vel,
+        const float motor_torq)
+    {
+        // Publish the legacy MotorCommand for simulation/ODrive-compatible nodes.
+        MotorCommand motor_cmd;
+        motor_cmd.control_mode = msg.control_mode; // control mode matches the leg control mode
+        motor_cmd.input_mode = MotorCommand::INPUT_MODE_PASSTHROUGH;
+        motor_cmd.pos_setpoint = motor_pos;
+        motor_cmd.vel_setpoint = motor_vel;
+        motor_cmd.torq_setpoint = motor_torq;
+        _motor_command_pubs[motor_idx]->publish(motor_cmd);
+
+        // Publish the CubeMars MIT command used by the hardware drivers:
+        // [position, velocity, kp, kd, torque].
+        Float64MultiArray mit_cmd;
+        mit_cmd.data.resize(5);
+        mit_cmd.data[0] = motor_pos;
+        mit_cmd.data[1] = motor_vel;
+        mit_cmd.data[2] = (msg.control_mode == LegCommand::CONTROL_MODE_POSITION) ? _motor_kp : 0.0;
+        mit_cmd.data[3] = (msg.control_mode == LegCommand::CONTROL_MODE_FORCE) ? 0.0 : _motor_kd;
+        mit_cmd.data[4] = motor_torq;
+        _motor_mit_cmd_pubs[motor_idx]->publish(mit_cmd);
+    }
+
     /*
      * Callback function for leg command messages
      */
@@ -158,32 +204,31 @@ private:
         const Vector3f vel_setpoint = fromVector3(msg.vel_setpoint);
         const Vector3f force_setpoint = fromVector3(msg.force_setpoint);
 
-        // Compute the current jacobian matrix
-        const Matrix3f jacobian = _model->compute_jacobian_matrix(_get_latest_motor_positions());
-
-        // Make sure the jacobian is invertible
-        if (jacobian.determinant() == 0.0)
+        // Position-only trajectories do not need feedback-derived jacobians.  This
+        // lets run_trajectory drive CubeMars hardware even when no legacy
+        // motor/estimate publisher is present.
+        const bool needs_jacobian = _requires_jacobian(msg);
+        Matrix3f jacobian = Matrix3f::Identity();
+        if (needs_jacobian)
         {
-            RCLCPP_ERROR(_node->get_logger(), "Jacobian determinant is zero");
-            return;
+            jacobian = _model->compute_jacobian_matrix(_get_latest_motor_positions());
+
+            // Make sure the jacobian is invertible
+            if (jacobian.determinant() == 0.0)
+            {
+                RCLCPP_ERROR(_node->get_logger(), "Jacobian determinant is zero");
+                return;
+            }
         }
 
         // Compute the motor positions, velocities, and torques
         const Vector3f motor_pos = _model->compute_inverse_kinematics(pos_setpoint);
-        const Vector3f motor_vels = jacobian.inverse() * vel_setpoint;
-        const Vector3f motor_torqs = jacobian.transpose() * force_setpoint;
+        const Vector3f motor_vels = needs_jacobian ? jacobian.inverse() * vel_setpoint : Vector3f::Zero();
+        const Vector3f motor_torqs = needs_jacobian ? jacobian.transpose() * force_setpoint : Vector3f::Zero();
 
         for (std::size_t i = 0; i < _model->get_num_motors(); i++)
         {
-            // Create new ROS messages for each motor command
-            MotorCommand motor_cmd;
-            motor_cmd.control_mode = msg.control_mode; // control mode matches the leg control mode
-            motor_cmd.pos_setpoint = motor_pos(i);
-            motor_cmd.vel_setpoint = motor_vels(i);
-            motor_cmd.torq_setpoint = motor_torqs(i);
-
-            // Publish the motor command to the corresponding motor topic
-            _motor_command_pubs[i]->publish(motor_cmd);
+            _publish_motor_commands(msg, i, motor_pos(i), motor_vels(i), motor_torqs(i));
         }
     }
 
@@ -229,6 +274,11 @@ public:
         // Set the motor estimates vector size to the number of motors
         _latest_motor_estimates.resize(num_motors);
 
+        node->declare_parameter("motor_kp", 50.0);
+        node->declare_parameter("motor_kd", 0.05);
+        _motor_kp = node->get_parameter("motor_kp").as_double();
+        _motor_kd = node->get_parameter("motor_kd").as_double();
+
         // Create publisher and subscriber for leg commands and estimates
         _leg_command_sub = node->create_subscription<LegCommand>(
             "leg/command", qos_reliable(), std::bind(&LegKinematicsNode::_leg_command_callback, this, std::placeholders::_1));
@@ -236,17 +286,32 @@ public:
 
         for (std::size_t m = 0; m < num_motors; m++)
         {
-            // Create a callback function for each motor estimate subscription
+            // Create a callback function for each legacy motor estimate subscription
             const auto estimate_callback = [this, m](const MotorEstimate::SharedPtr msg)
             {
                 _latest_motor_estimates[m] = *msg;
             };
 
-            // Create the subscibers and publishers for each motor
+            // Create a callback function for each CubeMars motor state subscription
+            const auto state_callback = [this, m](const MotorState::SharedPtr msg)
+            {
+                _latest_motor_estimates[m].pos_estimate = msg->position;
+                _latest_motor_estimates[m].vel_estimate = msg->velocity;
+                _latest_motor_estimates[m].torq_estimate = msg->torque;
+            };
+
+            // Create the subscribers and publishers for each motor.  The legacy
+            // command/estimate topics keep simulation support, while the
+            // motor_state/mit_cmd topics connect to the CubeMars v2 hardware
+            // driver used by SELQIE.
             _motor_estimate_subs.push_back(
                 node->create_subscription<MotorEstimate>("motor" + std::to_string(m) + "/estimate", qos_fast(), estimate_callback));
+            _motor_state_subs.push_back(
+                node->create_subscription<MotorState>("motor" + std::to_string(m) + "/motor_state", qos_fast(), state_callback));
             _motor_command_pubs.push_back(
                 node->create_publisher<MotorCommand>("motor" + std::to_string(m) + "/command", qos_reliable()));
+            _motor_mit_cmd_pubs.push_back(
+                node->create_publisher<Float64MultiArray>("motor" + std::to_string(m) + "/mit_cmd", qos_reliable()));
         }
 
         // Create a timer for periodic leg estimates

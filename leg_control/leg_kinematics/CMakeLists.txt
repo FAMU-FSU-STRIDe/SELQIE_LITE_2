@@ -10,6 +10,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(actuation_msgs REQUIRED)
 find_package(leg_control_msgs REQUIRED)
+find_package(motor_interfaces REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # Eigen3
 find_package(Eigen3 REQUIRED)
@@ -19,7 +21,7 @@ include_directories(SYSTEM ${EIGEN3_INCLUDE_DIR})
 include_directories(include)
 
 add_executable(fivebar2d_node src/fivebar2d_node.cpp)
-ament_target_dependencies(fivebar2d_node rclcpp actuation_msgs leg_control_msgs)
+ament_target_dependencies(fivebar2d_node rclcpp actuation_msgs leg_control_msgs motor_interfaces std_msgs)
 target_link_libraries(fivebar2d_node Eigen3::Eigen)
 
 # install targets
