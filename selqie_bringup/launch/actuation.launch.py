@@ -10,11 +10,12 @@ CAN_LAUNCH_FILE = os.path.join(
 CUBEMARS_LAUNCH_FILE = os.path.join(
         get_package_share_directory('actuation_bringup'), 'launch', 'cubemars.launch.py')
 
-# ── Servo-mode notes ───────────────────────────────────────────────────────────
-# The CubeMars motors run in SERVO mode. Servo mode has NO Kp/Kd gains — the
-# position and velocity loops live inside the driver and are configured over
-# R-LINK, not over CAN. There is therefore nothing to tune here; per-group gain
-# constants have been removed. Retune the loops in the R-LINK upper computer.
+# ── MIT-mode notes ────────────────────────────────────────────────────────────
+# The CubeMars motors run in MIT mode, so Kp/Kd are sent in every CAN frame
+# rather than configured over R-LINK. There are no gain constants here on
+# purpose: they live in actuation_bringup/config/mit_gains.yaml, which every
+# motor node loads, and can also be retuned live from selqie_terminal
+# (`set_gains`) without restarting anything.
 # ──────────────────────────────────────────────────────────────────────────────
 
 

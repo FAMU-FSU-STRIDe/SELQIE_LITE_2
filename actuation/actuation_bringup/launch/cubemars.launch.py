@@ -33,7 +33,6 @@ def launch_setup(context, *args, **kwargs):
         'can_interface': interface,
         'can_id': int(motor_id),
         'motor_type': motor_type,
-        'control_hz': float(control_hz),
         'joint_name': joint_name,
         'auto_start': auto_start.lower() in ('true', '1', 'yes'),
         'cmd_timeout': float(cmd_timeout),
@@ -41,7 +40,8 @@ def launch_setup(context, *args, **kwargs):
     }
     # Only override a gain when it was actually given, so the YAML stays the
     # single source of truth unless someone deliberately overrides it.
-    for name, value in (('position_kp', position_kp),
+    for name, value in (('control_hz', control_hz),
+                        ('position_kp', position_kp),
                         ('position_kd', position_kd),
                         ('velocity_kd', velocity_kd),
                         ('torque_limit_scale', torque_limit_scale)):
@@ -71,9 +71,9 @@ def generate_launch_description():
             'motor_type', default_value='AK40-10', description='Cubemars motor type.'
         ),
         DeclareLaunchArgument(
-            'control_hz',
-            default_value='500.0',
-            description='Rate (Hz) at which MIT command frames are sent.',
+            'control_hz', default_value='',
+            description='Override the MIT command rate (Hz). Blank = use '
+                        'mit_gains.yaml, which documents the CAN bus budget.',
         ),
         DeclareLaunchArgument(
             'auto_start',

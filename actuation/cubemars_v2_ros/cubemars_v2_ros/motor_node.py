@@ -91,6 +91,17 @@ TORQUE_CONSTANTS = {"AK40-10": 0.056, "AK10-9": 0.16,
 GEAR_RATIOS = {"AK40-10": 10, "AK10-9": 9, "AK60-6": 6, "AK70-10": 10,
                "AK80-6": 6, "AK80-8": 8, "AK80-9": 9, "AK80-64": 64}
 
+# ---- CAN bandwidth budget -------------------------------------------------
+# Used only to warn at startup when the command rate cannot physically fit on
+# the bus. A standard-ID 8-byte CAN frame is 111 bits, up to 135 once bit
+# stuffing kicks in; the driver answers every command with a reply frame, so
+# each motor costs 2 frames per control cycle. The AK bus is fixed at 1 Mbit/s.
+CAN_BITRATE = 1_000_000
+CAN_FRAME_BITS = 135          # worst case, including bit stuffing
+CAN_FRAMES_PER_CYCLE = 2      # command + reply
+MOTORS_PER_BUS = 4            # SELQIE splits its 8 actuators over can0 and can1
+CAN_LOAD_WARN = 0.80          # conventional ceiling for a healthy CAN bus
+
 
 class MotorNode(Node):
     """Drives one CubeMars actuator over CAN using the MIT protocol."""
@@ -155,6 +166,8 @@ class MotorNode(Node):
             f"\n  position resolution: {mit.position_resolution(self.R)*1e3:.3f} mrad"
             f"\n  tune live:  ros2 topic pub --once /{self.joint_name}/set_gains "
             f"std_msgs/msg/Float64MultiArray \"{{data: [kp, kd]}}\"")
+
+        self._warn_if_over_can_budget()
 
         # ---- CAN ----
         # MIT mode uses STANDARD (11-bit) IDs: commands go to the motor ID,
@@ -311,6 +324,25 @@ class MotorNode(Node):
         else:
             self.get_logger().warn(
                 f"unknown special command '{m}'; use start|exit|zero|clear")
+
+    def _warn_if_over_can_budget(self):
+        """Warn when control_hz asks for more bus than 1 Mbit/s can deliver.
+
+        Over budget, frames queue up and reach the driver late and unevenly,
+        which shows up as jittery motion and audible roughness rather than as
+        an outright error -- so it is worth saying out loud at startup.
+        """
+        load = (self.control_hz * MOTORS_PER_BUS * CAN_FRAMES_PER_CYCLE
+                * CAN_FRAME_BITS / CAN_BITRATE)
+        if load <= CAN_LOAD_WARN:
+            return
+        headroom = (CAN_LOAD_WARN * CAN_BITRATE
+                    / (MOTORS_PER_BUS * CAN_FRAMES_PER_CYCLE * CAN_FRAME_BITS))
+        self.get_logger().warn(
+            f"control_hz={self.control_hz:.0f} needs {load * 100:.0f}% of the "
+            f"1 Mbit/s CAN bus with {MOTORS_PER_BUS} motors on {self.iface}. "
+            f"Expect late, uneven frames. Lower control_hz to ~{headroom:.0f} "
+            f"in mit_gains.yaml, or split the motors across two interfaces.")
 
     def _enter_mit_mode(self):
         """Enter MIT control mode -- required before any motion command."""

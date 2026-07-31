@@ -52,6 +52,19 @@ def test_float_uint_roundtrip_within_resolution():
         assert back == pytest.approx(value, abs=step)
 
 
+def test_quantization_rounds_to_nearest_not_toward_zero():
+    # The midpoint of a symmetric range is a half code, so truncation would put
+    # an exact 0.0 command one LSB low. Round-to-nearest keeps the error inside
+    # half an LSB in every field, which is what makes a "limp" frame really limp.
+    for bits, lo, hi in ((16, LIMITS["P_MIN"], LIMITS["P_MAX"]),
+                         (12, LIMITS["V_MIN"], LIMITS["V_MAX"]),
+                         (12, LIMITS["T_MIN"], LIMITS["T_MAX"])):
+        u = mit.float_to_uint(0.0, lo, hi, bits)
+        half_lsb = (hi - lo) / ((1 << bits) - 1) / 2.0
+        # 0.0 sits exactly half an LSB from a code, so allow float slop.
+        assert abs(mit.uint_to_float(u, lo, hi, bits)) <= half_lsb * (1 + 1e-9)
+
+
 def test_float_to_uint_clamps_out_of_range():
     assert mit.float_to_uint(999.0, -12.5, 12.5, 16) == 65535
     assert mit.float_to_uint(-999.0, -12.5, 12.5, 16) == 0

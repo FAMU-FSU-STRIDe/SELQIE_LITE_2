@@ -147,6 +147,25 @@ are `Kp ≤ 500`, `Kd ≤ 5`; anything larger is clipped before packing.
 up, so a bad gain cannot command full torque into a hard stop. It also improves the 12-bit torque
 resolution over the reduced range.
 
+### If the motors whine
+
+**A bare `ready` sends `Kp = Kd = torque = 0`** — the motor is deliberately limp, and no gain in the
+YAML can be the cause. The whine at that moment is the driver's FOC current loop energising, which
+these drivers do audibly. Confirm by hand: if the output shaft still back-drives freely, the driver
+is idling, not fighting a command. `idle` (`0xFD`) de-energises it and the whine should stop.
+
+Whine that only appears **once a position is commanded** *is* a gain problem. Bisect it live:
+
+```
+set_gains 5.0 0.0     # Kd off — whine stops? Kd is amplifying encoder velocity noise; lower it
+set_gains 0.0 0.4     # Kp off — whine stops? Kp is too stiff; lower it
+gains                 # confirm what every motor actually took
+```
+
+Whine whose pitch tracks `control_hz` points at CAN bandwidth instead — see
+[CAN bandwidth](#can-bandwidth). At the shipped 500 Hz there is ample headroom, so this only applies
+if the rate has been raised.
+
 ---
 
 ## `run_trajectory` and setpoint resampling
@@ -349,7 +368,7 @@ float32 torq_estimate  # Nm
 | `motor_id` / `can_id` | `0` | CAN node ID (0–7) |
 | `motor_type` | `AK40-10` | Motor model string |
 | `interface` / `can_interface` | `can0` | SocketCAN interface name |
-| `control_hz` | `500.0` | MIT frame rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
+| `control_hz` | `500.0` | MIT frame rate. From `mit_gains.yaml`. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python); see [CAN bandwidth](#can-bandwidth) |
 | `position_kp` | `5.0` | POSITION-mode stiffness (0–500). From `mit_gains.yaml` |
 | `position_kd` | `0.4` | POSITION-mode damping (0–5). From `mit_gains.yaml` |
 | `velocity_kd` | `0.5` | VELOCITY-mode damping (0–5). From `mit_gains.yaml` |
@@ -400,6 +419,22 @@ To verify CAN traffic:
 candump can0
 candump can1
 ```
+
+### CAN bandwidth
+
+The driver answers every MIT command with a reply frame, so each motor costs **2 frames per control
+cycle**. A standard-ID 8-byte CAN frame is 111 bits, up to 135 once bit stuffing kicks in. With 4
+motors on each interface:
+
+| `control_hz` | Bus load (best – worst) | |
+|---|---|---|
+| 500 | 44 % – 54 % | current setting |
+| 700 | 62 % – 76 % | |
+| 800 | 71 % – 86 % | node warns from ~740 Hz |
+| 1000 | 89 % – 108 % | saturated; frames arrive late and uneven |
+
+The motor node logs a warning at startup if `control_hz` puts the bus over 80 %. These figures assume
+the 4/4 split above — moving all 8 motors onto one interface doubles them.
 
 ---
 

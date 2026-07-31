@@ -104,12 +104,18 @@ def float_to_uint(x, lo, hi, bits):
 
     This is the MIT protocol's scaling: the range maps linearly onto the full
     unsigned range, so ``lo`` -> 0 and ``hi`` -> 2**bits - 1.
+
+    Rounds to nearest rather than truncating. Every field here has a symmetric
+    range, so the midpoint lands on a half code (2**bits - 1 is odd): truncating
+    would push an exact 0.0 command one LSB below centre, which the motor decodes
+    as a small negative value. For torque that is a standing bias the driver
+    keeps regulating to even when the command is "limp".
     """
     span = hi - lo
     if span <= 0:
         return 0
     x = clamp(x, lo, hi)
-    return int((x - lo) * ((1 << bits) - 1) / span)
+    return int((x - lo) * ((1 << bits) - 1) / span + 0.5)
 
 
 def uint_to_float(u, lo, hi, bits):

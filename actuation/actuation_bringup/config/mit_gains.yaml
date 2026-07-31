@@ -50,10 +50,49 @@
 #    ros2 topic echo /motor0/gains
 #
 #  Live values are NOT persisted -- copy anything you like back into this file.
+#
+#  ---------------------------------------------------------------------------
+#  IF THE MOTORS WHINE
+#  ---------------------------------------------------------------------------
+#  A bare `ready` sends Kp = Kd = torque = 0, so the motor is limp and no gain
+#  here can be the cause -- that whine is the driver's FOC/PWM current loop
+#  simply being energised. Check by hand: if the output shaft back-drives
+#  freely, the driver is idling, not fighting a command.
+#
+#  Whine that appears only once a position is commanded IS a gain problem.
+#  Bisect it live from selqie_terminal:
+#      set_gains 5.0 0.0     # Kd off -> if the whine stops, Kd is amplifying
+#                            #           encoder velocity noise; lower it
+#      set_gains 0.0 0.4     # Kp off -> if the whine stops, Kp is too stiff
+#      gains                 # confirm what every motor actually took
+#
+#  Whine that changes pitch with the control rate is a CAN bandwidth problem --
+#  see control_hz below. At the shipped 500 Hz there is plenty of headroom, so
+#  this is only worth checking if the rate has been raised.
 # =============================================================================
 
 /**:
   ros__parameters:
+
+    # ---- Command rate ----
+    # How often each motor node sends an MIT frame. The driver answers every
+    # command with a reply frame, so the bus carries 2 frames per motor per
+    # cycle. A standard-ID 8-byte CAN frame is 111 bits, up to 135 after bit
+    # stuffing, and the AK bus is fixed at 1 Mbit/s. SELQIE splits its 8 motors
+    # over can0 (0,1,6,7) and can1 (2,3,4,5), so 4 motors share each bus:
+    #
+    #     control_hz    bus load (best - worst case)
+    #        500          44% -  54%     <- current setting, comfortable
+    #        600          53% -  65%
+    #        700          62% -  76%
+    #        800          71% -  86%     <- node starts warning around here
+    #       1000          89% - 108%     <- saturated, frame timing goes ragged
+    #
+    # 500 Hz fits with room to spare. Past ~740 Hz the bus can no longer carry
+    # the traffic and commands reach the driver late and unevenly; the node logs
+    # a warning at startup when that happens. Note this assumes the 4/4 split --
+    # putting all 8 motors on one interface doubles every number above.
+    control_hz: 500.0
 
     # ---- POSITION control mode (used by all gaits) ----
     # The stride generators command positions, so these are the gains that

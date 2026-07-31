@@ -72,11 +72,14 @@ def _install_stubs():
             self.value = value
 
     class _Logger:
+        def __init__(self):
+            self.warnings = []
+
         def info(self, *a, **k):
             pass
 
-        def warn(self, *a, **k):
-            pass
+        def warn(self, msg, *a, **k):
+            self.warnings.append(str(msg))
 
         def error(self, *a, **k):
             pass
@@ -457,3 +460,36 @@ def test_gains_are_republished_for_late_subscribers(make_node):
     echoed = [m for topic, m in node.published if topic.endswith("/gains")]
     assert echoed
     assert len(echoed[-1].data) == 3      # [kp, kd, velocity_kd]
+
+
+# ------------------------- CAN bandwidth budget -------------------------
+
+
+def test_neutral_frame_commands_a_genuinely_limp_motor(make_node):
+    """`ready` alone must leave the motor free: no stiffness, damping or torque.
+
+    A whine at this point is the driver's current loop energising, not anything
+    the node asked for -- which is only true if the frame really is all zeros.
+    """
+    node, _ = make_node()
+    node._enter_mit_mode()
+    node._tick()
+    p, v, kp, kd, t = _decode(_drive_frames(node)[-1], node.R)
+    assert (kp, kd) == (0.0, 0.0)
+    # Quantization cannot land exactly on zero (odd full scale), but rounding
+    # keeps every field inside half an LSB instead of a full one below centre.
+    assert abs(p) <= mit.position_resolution(node.R) / 2 * (1 + 1e-9)
+    assert abs(t) <= (node.R["T_MAX"] - node.R["T_MIN"]) / 4095 / 2 * (1 + 1e-9)
+    assert abs(v) <= (node.R["V_MAX"] - node.R["V_MIN"]) / 4095 / 2 * (1 + 1e-9)
+
+
+def test_warns_when_control_rate_exceeds_the_can_bus(make_node):
+    """1 kHz x 4 motors x (command + reply) does not fit on 1 Mbit/s."""
+    node, _ = make_node(control_hz=1000.0)
+    assert any("CAN bus" in w for w in node.get_logger().warnings)
+
+
+def test_no_warning_at_the_shipped_control_rate(make_node):
+    """500 Hz uses about half the bus with the 4-motors-per-interface split."""
+    node, _ = make_node(control_hz=500.0)
+    assert not any("CAN bus" in w for w in node.get_logger().warnings)
