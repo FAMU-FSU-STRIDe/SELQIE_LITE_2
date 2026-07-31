@@ -202,12 +202,17 @@ With `v_des = 0`, the Kd term becomes `−Kd·v_meas` — damping against **the 
 itself** rather than against tracking error, so it fights the very stride it is
 supposed to execute. On `walk_20cm_stride.txt` at `Kd = 0.4`:
 
-| gait freq | `Kd·v` with `v_des = 0` | as % of the 4.1 N·m peak | with estimated `v_des` |
+Every value below is the **damping torque** `|Kd·(v_des − v_meas)|` in N·m — the
+two right-hand columns are the same quantity under the two conditions. (`v_des`
+itself is a velocity in rad/s; it is the product with `Kd` that has units of
+torque, since `Kd` is N·m·s/rad.)
+
+| gait freq | peak joint speed | damping torque, `v_des = 0` | damping torque, `v_des` estimated |
 |---|---|---|---|
-| 0.5 | 3.05 N·m | 74% | 0.05 N·m (1.3%) |
-| 1 | 6.11 N·m | **149%** | 0.11 N·m (2.6%) |
-| 2 | 12.21 N·m | 298% | 0.22 N·m (5.2%) |
-| 3 | 18.32 N·m | 447% | 0.32 N·m (7.9%) |
+| 0.5 | 7.6 rad/s | 3.05 N·m (74% of peak) | 0.05 N·m (1.3%) |
+| 1 | 15.3 rad/s | 6.11 N·m (**149%**) | 0.11 N·m (2.6%) |
+| 2 | 30.5 rad/s | 12.21 N·m (298%) | 0.22 N·m (5.2%) |
+| 3 | 45.8 rad/s | 18.32 N·m (447%) | 0.32 N·m (7.9%) |
 
 At 1 Hz the damping term alone demands more than the motor's entire peak torque,
 purely to oppose its own commanded motion — the motor saturates fighting itself
