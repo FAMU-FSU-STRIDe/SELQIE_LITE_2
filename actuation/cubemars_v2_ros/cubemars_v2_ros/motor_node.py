@@ -144,19 +144,23 @@ class MotorNode(Node):
         self.declare_parameter("gear_ratio", 0.0)
         self.declare_parameter("cmd_timeout", 0.5)  # seconds before a stale cmd is cleared
         # POSITION-mode streaming. Selectable at runtime via the special commands
-        # "pos" / "pos_spd" (the UI sets pos for all gaits and pos_spd for the
-        # stand/ready hold).
-        #  "pos_spd" (default): SET_POS_SPD with a trajectory-derived speed
-        #            feed-forward. Smooth, and the right choice for the gentle
-        #            stand/ready move and slow gaits. Its acceleration field is
-        #            protocol-capped (~245 rad/s^2 at the AK40-10 output), so
-        #            above ~1-1.5x gait frequency the motor cannot keep up and
-        #            loses positional accuracy.
+        # "pos" / "pos_spd" (the UI uses pos_spd for gaits and the stand/ready
+        # hold, and pos for runs whose frequency outruns the accel cap).
+        #  "pos_spd" (default): SET_POS_SPD, whose speed field is the travel
+        #            speed limit for each move. It is taken from the commanded
+        #            joint velocity, which leg_kinematics derives from the
+        #            trajectory's Cartesian velocity -- so the stride plays at
+        #            its intended speed, acceleration-shaped and smooth. The
+        #            acceleration field is protocol-capped (~245 rad/s^2 at the
+        #            AK40-10 output), which is the real ceiling: a stride whose
+        #            joint turnaround needs longer than the cycle itself cannot
+        #            be tracked, and the node warns when that happens.
         #  "pos":    plain SET_POS. The driver drives to each streamed setpoint
         #            with the motor's full physical acceleration, so it tracks
-        #            position accurately at every gait frequency. Pair it with a
-        #            high control_hz so the setpoint stream is fine-grained
-        #            (smooth) rather than a coarse slam-and-wait staircase.
+        #            position accurately at every gait frequency, at the cost of
+        #            the acceleration shaping. Pair it with a high control_hz so
+        #            the setpoint stream is fine-grained (smooth) rather than a
+        #            coarse slam-and-wait staircase.
         self.declare_parameter("position_mode", "pos_spd")
         # Acceleration limit (ERPM/s) for pos_spd streaming. Defaults to the
         # protocol maximum so acceleration is not the bottleneck when the gait
@@ -305,6 +309,9 @@ class MotorNode(Node):
         # trajectory speed from consecutive setpoints. Reset whenever the motor
         # stops being driven so the first move after a pause is not a huge step.
         self._last_ff_pos_rad = None
+        # Last commanded pos_spd travel speed, to spot when the trajectory asks
+        # the speed to change faster than pos_spd_accel can deliver.
+        self._last_ff_speed_erpm = None
         self._speed_cap_erpm = abs(
             sp.rads_to_erpm(self.R["V_MAX"], self.gear_ratio, self.pole_pairs)
         )
@@ -425,6 +432,7 @@ class MotorNode(Node):
                 with self._lock:
                     self.position_mode = m
                     self._last_ff_pos_rad = None  # restart feed-forward cleanly
+                    self._last_ff_speed_erpm = None
                 self.get_logger().info(
                     f"Position mode -> {m} for motor {self.joint_name}"
                 )
@@ -497,14 +505,16 @@ class MotorNode(Node):
         # MIT node's "all zeros" behaviour.
         if not self._started or neutral:
             self._last_ff_pos_rad = None  # next position move restarts the feed-forward
+            self._last_ff_speed_erpm = None
             self._send_current(0.0)
             return
 
         if mode == MotorCommand.CONTROL_MODE_POSITION and self.position_mode == "pos_spd":
-            self._send_position_velocity(pos)
+            self._send_position_velocity(pos, vel)
             return
         # Any other mode abandons the position feed-forward history.
         self._last_ff_pos_rad = None
+        self._last_ff_speed_erpm = None
         if mode == MotorCommand.CONTROL_MODE_POSITION:
             self._send_position(pos)
         elif mode == MotorCommand.CONTROL_MODE_VELOCITY:
@@ -535,24 +545,43 @@ class MotorNode(Node):
         can_id, data = sp.pack_pos(self.node_id, sp.rad_to_deg(pos_rad))
         self._send(can_id, data)
 
-    def _send_position_velocity(self, pos_rad):
-        """Command an output-shaft position (rad) with a velocity feed-forward.
+    def _send_position_velocity(self, pos_rad, vel_rads=0.0):
+        """Command an output-shaft position (rad) with a speed feed-forward.
 
-        Streams SET_POS_SPD frames whose speed is derived from the change in the
-        commanded position over one control period, so the motor tracks the
-        trajectory at its own speed instead of slamming to each setpoint at the
-        motor's maximum speed (which rings on wide/fast gaits such as swim).
+        SET_POS_SPD's speed field is the *travel speed limit* for the move, not
+        a target to hold, so getting it right is what decides how fast the
+        trajectory actually plays. Two sources, in order of preference:
+
+        1. ``vel_rads`` -- the commanded joint velocity, which leg_kinematics
+           derives from the trajectory's Cartesian velocity through the inverse
+           Jacobian. This is the trajectory's own intended speed, known exactly
+           and independent of transport timing, so it is used whenever present.
+
+        2. A finite difference of consecutive commanded positions, for callers
+           that send position alone (``set_motor_position``, the stand hold).
+           This samples a zero-order-held signal at the control rate, so it is
+           only as good as the phase alignment between arriving commands and
+           control ticks: when a tick sees no new command the difference is 0
+           and the speed drops to the floor, and when it sees two it doubles.
+           Since the field is a *limit*, the low samples throttle the move
+           without the high ones making up for it -- which is why relying on
+           this alone made pos_spd gaits run slow.
         """
         if self.reverse_polarity:
             pos_rad = -pos_rad
+            vel_rads = -vel_rads
 
-        if self._last_ff_pos_rad is None:
-            # First move of a run: no history yet, so there is no feed-forward.
-            speed_erpm = 0.0
-        else:
-            vel_rads = (pos_rad - self._last_ff_pos_rad) * self.control_hz
+        if vel_rads:
             speed_erpm = abs(
                 sp.rads_to_erpm(vel_rads, self.gear_ratio, self.pole_pairs)
+            )
+        elif self._last_ff_pos_rad is None:
+            # First move of a run: no commanded velocity and no history yet.
+            speed_erpm = 0.0
+        else:
+            derived = (pos_rad - self._last_ff_pos_rad) * self.control_hz
+            speed_erpm = abs(
+                sp.rads_to_erpm(derived, self.gear_ratio, self.pole_pairs)
             )
         self._last_ff_pos_rad = pos_rad
 
@@ -560,10 +589,37 @@ class MotorNode(Node):
         # the first move still travel to the target, then cap it at V_MAX.
         speed_erpm = min(max(speed_erpm, self._min_speed_erpm), self._speed_cap_erpm)
 
+        self._warn_if_over_accel_budget(speed_erpm)
+
         can_id, data = sp.pack_pos_spd(
             self.node_id, sp.rad_to_deg(pos_rad), speed_erpm, self.pos_spd_accel
         )
         self._send(can_id, data)
+
+    def _warn_if_over_accel_budget(self, speed_erpm):
+        """Warn when the speed limit is changing faster than accel can follow.
+
+        ``pos_spd_accel`` caps how fast the driver may change its travel speed
+        (protocol maximum 327670 ERPM/s^2, ~245 rad/s^2 at the AK40-10 output).
+        When the trajectory asks the speed to change by more than that in one
+        control period, the driver ramps instead of following and the leg falls
+        behind its setpoints -- positional accuracy is lost quietly, with no
+        fault raised. Saying so beats leaving it to be discovered by eye.
+        """
+        budget = self.pos_spd_accel * self.control_dt
+        if budget <= 0.0:
+            return
+        previous = self._last_ff_speed_erpm
+        self._last_ff_speed_erpm = speed_erpm
+        if previous is None or abs(speed_erpm - previous) <= budget:
+            return
+        over = abs(speed_erpm - previous) / budget
+        self.get_logger().warn(
+            f"{self.joint_name}: pos_spd speed step is {over:.1f}x the "
+            f"acceleration budget; the driver will ramp and the leg will lag. "
+            f"Lower the gait frequency, or switch to 'pos' for this run.",
+            throttle_duration_sec=5.0,
+        )
 
     def _send_velocity(self, vel_rads):
         """Command an output-shaft velocity (rad/s)."""

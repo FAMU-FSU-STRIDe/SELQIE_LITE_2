@@ -93,6 +93,50 @@ private:
     int _current_index; // Current index in the stride trajectory
 
     /*
+     * Fill in a leg command's setpoint velocity by differentiating position
+     *
+     * The stride models set pos_setpoint only, leaving vel_setpoint at zero.
+     * That is not harmless: leg_kinematics maps this velocity through the
+     * inverse Jacobian into per-motor rad/s, and the motor node uses that as
+     * the SET_POS_SPD travel speed limit. A zero velocity therefore caps every
+     * move at the node's minimum-speed floor, and the gait crawls.
+     *
+     * Uses a central difference over the neighbouring stride points, which is
+     * second-order accurate for evenly spaced samples and introduces no
+     * half-sample phase lag -- a lagging speed limit would throttle each move
+     * exactly where it needs to be quickest. The stride is periodic, so the
+     * neighbours wrap; the samples span one step short of a full cycle, so the
+     * average step is added back to recover the true period.
+     */
+    void _fill_setpoint_velocity(leg_control_msgs::msg::LegCommand &command,
+                                 const int leg, const int i) const
+    {
+        const std::size_t n = _model->get_trajectory_size();
+        if (n < 2)
+        {
+            // A held pose (stand, sink) has no velocity to speak of.
+            return;
+        }
+
+        const double span = _model->get_execution_time(static_cast<int>(n) - 1) - _model->get_execution_time(0);
+        const double period = span + span / static_cast<double>(n - 1);
+        const double step = period / static_cast<double>(n);
+        if (step <= 0.0)
+        {
+            return;
+        }
+
+        const int ahead = static_cast<int>((i + 1) % static_cast<int>(n));
+        const int behind = static_cast<int>((i - 1 + static_cast<int>(n)) % static_cast<int>(n));
+        const auto next = _model->get_leg_command(leg, ahead).pos_setpoint;
+        const auto prev = _model->get_leg_command(leg, behind).pos_setpoint;
+
+        command.vel_setpoint.x = (next.x - prev.x) / (2.0 * step);
+        command.vel_setpoint.y = (next.y - prev.y) / (2.0 * step);
+        command.vel_setpoint.z = (next.z - prev.z) / (2.0 * step);
+    }
+
+    /*
      * Gait callback function
      * This function is called when a new gait command is received
      */
@@ -212,7 +256,10 @@ private:
         for (int leg = 0; leg < NUM_LEGS; ++leg)
         {
             // Get the leg command for the current index
-            const auto leg_command = _model->get_leg_command(leg, _current_index);
+            auto leg_command = _model->get_leg_command(leg, _current_index);
+
+            // Fill in the setpoint velocity the stride models do not provide
+            _fill_setpoint_velocity(leg_command, leg, _current_index);
 
             // Publish the leg command
             _leg_command_pubs[leg]->publish(leg_command);

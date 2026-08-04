@@ -74,11 +74,14 @@ def _install_stubs():
             self.value = value
 
     class _Logger:
+        def __init__(self):
+            self.warnings = []
+
         def info(self, *a, **k):
             pass
 
-        def warn(self, *a, **k):
-            pass
+        def warn(self, msg, *a, **k):
+            self.warnings.append(str(msg))
 
         def error(self, *a, **k):
             pass
@@ -464,3 +467,129 @@ def test_gear_and_pole_override(make_node):
     node, mn = make_node(motor_type="AK40-10", pole_pairs=10, gear_ratio=5.0)
     assert node.pole_pairs == 10
     assert node.gear_ratio == 5.0
+
+
+# ---------------- pos_spd travel speed from the commanded velocity ----------
+
+
+def _speed_erpm(node):
+    """Travel speed (ERPM) on the wire in the last SET_POS_SPD frame."""
+    frame = _last_frame(node)
+    pid, _ = sp.parse_status_id(frame.arbitration_id)
+    assert pid == sp.CAN_PACKET_SET_POS_SPD
+    return struct.unpack(">h", frame.data[4:6])[0] * sp.POS_SPD_SPEED_SCALE
+
+
+def test_pos_spd_prefers_the_commanded_velocity(make_node):
+    """The command's own velocity is the travel speed, not a tick difference.
+
+    leg_kinematics derives vel_setpoint from the trajectory, so it is exact and
+    independent of when commands happen to land relative to control ticks.
+    """
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.10
+    cmd.vel_setpoint = 12.0            # rad/s at the joint
+    node.on_motor_command(cmd)
+    node._tick_control()
+
+    assert _speed_erpm(node) == pytest.approx(sp.rads_to_erpm(12.0, 10, 14),
+                                              abs=sp.POS_SPD_SPEED_SCALE)
+
+
+def test_commanded_velocity_beats_a_stalled_position_difference(make_node):
+    """A repeated setpoint must not throttle a stride that is still moving.
+
+    This is the failure that made pos_spd gaits run slow: two control ticks
+    seeing the same cached position derive a zero difference and fall back to
+    the min-speed floor, and because the field is a *limit* the move is capped
+    there. With the trajectory's velocity present the speed stays correct.
+    """
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.10
+    cmd.vel_setpoint = 12.0
+
+    node.on_motor_command(cmd)
+    node._tick_control()
+    node.on_motor_command(cmd)         # identical position, still moving
+    node._tick_control()
+
+    speed = _speed_erpm(node)
+    assert speed == pytest.approx(sp.rads_to_erpm(12.0, 10, 14),
+                                  abs=sp.POS_SPD_SPEED_SCALE)
+    assert speed > node._min_speed_erpm * 5   # nowhere near the floor
+
+
+def test_commanded_velocity_sign_does_not_reverse_the_travel_speed(make_node):
+    # The speed field is a magnitude limit; direction comes from the position.
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = -0.10
+    cmd.vel_setpoint = -12.0
+    node.on_motor_command(cmd)
+    node._tick_control()
+    assert _speed_erpm(node) == pytest.approx(sp.rads_to_erpm(12.0, 10, 14),
+                                              abs=sp.POS_SPD_SPEED_SCALE)
+
+
+def test_commanded_velocity_is_still_capped_at_v_max(make_node):
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.10
+    cmd.vel_setpoint = 500.0           # far past the AK40-10's 45.5 rad/s
+    node.on_motor_command(cmd)
+    node._tick_control()
+    assert _speed_erpm(node) <= node._speed_cap_erpm + sp.POS_SPD_SPEED_SCALE
+
+
+def test_position_only_commands_still_use_the_tick_difference(make_node):
+    """set_motor_position and the stand hold send no velocity; keep working."""
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.10
+    node.on_motor_command(cmd)
+    node._tick_control()
+    cmd.pos_setpoint = 0.15            # 0.05 rad in one 100 Hz tick -> 5 rad/s
+    node.on_motor_command(cmd)
+    node._tick_control()
+    assert _speed_erpm(node) == pytest.approx(sp.rads_to_erpm(5.0, 10, 14),
+                                              abs=sp.POS_SPD_SPEED_SCALE)
+
+
+def test_warns_when_the_speed_step_outruns_the_accel_cap(make_node):
+    """A stride whose speed swings faster than pos_spd_accel can ramp lags."""
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.10
+    cmd.vel_setpoint = 0.5
+    node.on_motor_command(cmd)
+    node._tick_control()
+    node.get_logger().warnings.clear()
+
+    cmd.vel_setpoint = 40.0            # a 39.5 rad/s swing in one 10 ms tick
+    node.on_motor_command(cmd)
+    node._tick_control()
+    assert any("acceleration budget" in w for w in node.get_logger().warnings)
+
+
+def test_no_accel_warning_when_the_speed_changes_gently(make_node):
+    node, mn = make_node(motor_type="AK40-10", control_hz=100.0, position_mode="pos_spd")
+    cmd = mn.MotorCommand()
+    cmd.control_mode = mn.MotorCommand.CONTROL_MODE_POSITION
+    cmd.pos_setpoint = 0.10
+    cmd.vel_setpoint = 10.0
+    node.on_motor_command(cmd)
+    node._tick_control()
+    node.get_logger().warnings.clear()
+
+    cmd.vel_setpoint = 10.2            # well inside 245 rad/s^2 * 10 ms
+    node.on_motor_command(cmd)
+    node._tick_control()
+    assert not any("acceleration budget" in w for w in node.get_logger().warnings)

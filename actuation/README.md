@@ -51,26 +51,56 @@ additionally need the gear ratio, pole pairs, and torque constant listed below.
 
 † **Position streaming (`pos` vs `pos_spd`).** POSITION mode has two implementations, selected at
 runtime with the `pos`/`pos_spd` special commands (startup default from the `position_mode`
-parameter). The SELQIE UI picks between them by context: **`pos` for all gaits, `pos_spd` only for
-the stand/ready hold.**
+parameter). **`pos_spd` is the default for gaits and holds alike**; `pos` is the escape hatch for
+runs fast enough to outrun the acceleration cap (see the ceiling table below).
+
+* **`pos_spd` — `SET_POS_SPD` (§5.1.7).** Position, a **travel speed limit**, and a bounded
+  acceleration. The driver shapes the move instead of slamming to each setpoint, which is what keeps
+  wide/fast gaits like swim from ringing.
+
+  The speed field is the crux: it is a *limit on the move*, not a target to hold, so whatever is put
+  there is the fastest the leg will travel no matter how far ahead the setpoints run. The node takes
+  it from `MotorCommand.vel_setpoint` — the joint velocity `leg_kinematics` derives from the
+  trajectory's Cartesian velocity through the inverse Jacobian — so it is the stride's own intended
+  speed, exact and independent of transport timing. It is clamped to the motor's `V_MAX`.
+
+  For commands that carry position alone (`set_motor_position`, a held pose) the node falls back to
+  differencing consecutive commanded positions at `control_hz`, and floors the result at
+  `pos_spd_min_speed` (rad/s) so a static setpoint still travels to its target.
 
 * **`pos` — plain `SET_POS`.** The driver drives to each streamed setpoint using the motor's **full
-  physical acceleration**, so it tracks position accurately at *every* gait frequency — used for all
-  gaits. It is not acceleration-shaped, so a *coarse* setpoint stream would move as a slam-and-wait
-  staircase and can ring; the node streams finely at a high `control_hz` (default **500 Hz**) so the
-  position steps are small and the motion stays smooth.
+  physical acceleration**, so it tracks position accurately at *every* gait frequency, giving up the
+  acceleration shaping to do it. A *coarse* setpoint stream then moves as a slam-and-wait staircase
+  and can ring, so pair it with a high `control_hz` (default **500 Hz**) to keep the steps small.
 
-* **`pos_spd` — `SET_POS_SPD` (§5.1.7)** with a velocity feed-forward derived from the change in
-  commanded position over one control period, plus a bounded acceleration. Smooth — used for the
-  gentle stand/ready hold. **Not** used for gaits: its acceleration field is protocol-capped at
-  `pos_spd_accel` ≈ 327670 ERPM/s (~245 rad/s² at the AK40-10 output), and gait acceleration demand
-  grows with frequency *squared*, so above ~1–1.5× base frequency the motor cannot keep up and
-  **positional accuracy is lost**.
+**Why the trajectory files' velocities matter.** Every velocity column in
+`leg_trajectory_publisher/trajectories/*.txt` is zero, and the C++ stride generators likewise set
+position only. Fed straight through, `pos_spd`'s speed field collapsed to the `pos_spd_min_speed`
+floor and **the gait ran slow** — and because the fallback difference samples a zero-order-held
+signal at the control rate, a tick that saw no new command read zero while a tick that saw two read
+double; since the field is a limit, the low samples throttled the move and the high ones could not
+make up for it. Both producers now fill in velocities by central difference over the cycle
+(`estimate_leg_trajectory_velocities` in `selqie_python.selqie`, `_fill_setpoint_velocity` in
+`stride_generation_node.hpp`), so the speed limit is the one the stride actually calls for.
 
-  In `pos_spd`, the speed feed-forward is clamped to the motor's `V_MAX`, and a held/static setpoint
-  (e.g. the `stand` pose) produces zero feed-forward — so a minimum approach speed
-  (`pos_spd_min_speed`, rad/s) floors the commanded speed, letting held poses and the first move
-  still reach their target. It only binds when the trajectory is (near-)stationary.
+**The acceleration ceiling.** `pos_spd_accel` is protocol-capped at 327670 ERPM/s² ≈ **245 rad/s²**
+at the AK40-10 output. That bounds how fast the driver may change its travel speed, so a stride whose
+joint velocity has to reverse by Δv needs `Δv / 245` seconds just to turn around. Once that exceeds
+the cycle itself the leg cannot keep up and lags its setpoints silently — the motor node warns
+(throttled) when a commanded speed step outruns the budget. Measured from the shipped files, as a
+fraction of one cycle spent ramping:
+
+| `run_trajectory` frequency | `walk.txt` | `swim.txt` | `walk_20cm_stride.txt` | `jump.txt` |
+|---|---|---|---|---|
+| 0.5 Hz | 1 % | 1 % | 3 % | 15 % ‡ |
+| 1 Hz | 5 % | 5 % | 11 % | 61 % ‡ |
+| 2 Hz | 18 % | 21 % | 46 % | 244 % ‡ |
+| 3 Hz | 41 % | 48 % | **103 %** | 548 % ‡ |
+| 5 Hz | **113 %** | **133 %** | **286 %** | 1523 % ‡ |
+
+Bold entries cannot be tracked in `pos_spd` — use `pos` there. ‡ `jump.txt` also exceeds the motor's
+45.5 rad/s speed limit at every frequency (3.2× at 1 Hz), so it is speed-bound before it is
+acceleration-bound and both submodes run it at `V_MAX`.
 
 **Why `control_hz` matters.** `run_trajectory` resamples gait files to a constant
 `TRAJECTORY_RESAMPLE_HZ` (default 500 Hz, see `selqie_python.selqie`) regardless of the run
@@ -245,9 +275,9 @@ float32 torq_estimate  # Nm
 | `control_hz` | `500.0` | Setpoint stream / command rate. Should match `TRAJECTORY_RESAMPLE_HZ` (selqie_python) |
 | `pole_pairs` | `0` | Rotor pole pairs for ERPM scaling (`0` = per-motor table default) |
 | `gear_ratio` | `0.0` | Gear reduction for ERPM/torque scaling (`0` = per-motor table default) |
-| `position_mode` | `pos_spd` | Startup POSITION submode: `pos_spd` (feed-forward, smooth) or `pos` (plain SET_POS, accurate at all freq). Switchable at runtime via the `pos`/`pos_spd` special commands |
+| `position_mode` | `pos_spd` | Startup POSITION submode: `pos_spd` (acceleration-shaped, travels at the commanded velocity) or `pos` (plain SET_POS, accurate at all freq). Switchable at runtime via the `pos`/`pos_spd` special commands |
 | `pos_spd_accel` | `327670.0` | Acceleration limit (ERPM/s) for `pos_spd` streaming (protocol max) |
-| `pos_spd_min_speed` | `2.0` | Minimum approach speed (rad/s) for `pos_spd`; lets held poses (stand) reach their target |
+| `pos_spd_min_speed` | `2.0` | Minimum approach speed (rad/s) for `pos_spd`, applied only when the command carries no velocity; lets held poses (stand) reach their target |
 | `reverse_polarity` | `false` | Negate position/velocity/torque |
 | `cmd_timeout` | `0.5` | Seconds before a stale command releases the motor (0 = disabled) |
 | `auto_start` | `false` | Enable motor on node startup |

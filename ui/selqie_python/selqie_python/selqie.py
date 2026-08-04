@@ -91,6 +91,50 @@ def leg_trajectory_period(times: list[float]) -> float:
     return span + (span / (n - 1))
 
 
+def estimate_leg_trajectory_velocities(times: list[float], commands: list['LegCommand'],
+                                       period: float = 0.0):
+    """Fill in ``vel_setpoint`` by differentiating ``pos_setpoint`` in place.
+
+    The trajectory files carry position setpoints only -- every velocity and
+    force column is zero. In servo POSITION mode that is what makes the
+    ``pos_spd`` submode run slow: ``SET_POS_SPD``'s speed field is the *travel
+    speed limit* for the move, so a zero (or floored) speed caps how fast the
+    driver is willing to cross the position step, no matter how far ahead the
+    setpoints run. leg_kinematics maps this Cartesian velocity through the
+    inverse Jacobian into per-motor rad/s, so supplying it here is what lets the
+    motor node command the speed the stride actually calls for.
+
+    Uses a central difference, which for evenly spaced samples is second-order
+    accurate and (unlike a forward difference) introduces no half-sample phase
+    lag -- important here, because a lagging speed limit would throttle each
+    move exactly where it needs to be quickest.
+
+    The cycle is treated as periodic: the sample before the first is the last,
+    and the sample after the last is the first, one step further on. ``period``
+    supplies that wrap distance; if omitted it is derived from ``times``.
+    Samples are assumed evenly spaced, which holds because this runs on the
+    output of :func:`resample_leg_trajectory`.
+
+    Modifies ``commands`` in place and returns it.
+    """
+    n = len(times)
+    if n < 2:
+        return commands
+
+    if period <= 0.0:
+        period = leg_trajectory_period(times)
+    step = period / n  # uniform after resampling
+
+    positions = [(c.pos_setpoint.x, c.pos_setpoint.y, c.pos_setpoint.z) for c in commands]
+    for i, cmd in enumerate(commands):
+        ahead = positions[(i + 1) % n]
+        behind = positions[(i - 1) % n]
+        cmd.vel_setpoint.x = (ahead[0] - behind[0]) / (2.0 * step)
+        cmd.vel_setpoint.y = (ahead[1] - behind[1]) / (2.0 * step)
+        cmd.vel_setpoint.z = (ahead[2] - behind[2]) / (2.0 * step)
+    return commands
+
+
 def resample_leg_trajectory(times: list[float], commands: list['LegCommand'],
                             resample_hz: float, max_points: int = 0):
     """Resample one leg's trajectory to a constant setpoint rate.
@@ -271,6 +315,12 @@ class SELQIE(Node):
         # low frequency. 1000 keeps every frequency at or above the source
         # files' own density (they carry 330-500 points/cycle).
         self.TRAJECTORY_MAX_POINTS = 1000
+        # Fill in each setpoint's velocity by differentiating position (see
+        # estimate_leg_trajectory_velocities). The trajectory files carry zeros
+        # in every velocity column, and SET_POS_SPD treats the speed field as
+        # the travel limit for the move -- so without this the gait runs at the
+        # pos_spd_min_speed floor instead of its intended speed.
+        self.TRAJECTORY_ESTIMATE_VELOCITY = True
 
         self._leg_command_publishers = []
         for i in range(self.NUM_LEGS):
@@ -447,8 +497,14 @@ class SELQIE(Node):
     def set_all_motors_position_mode(self, mode : str):
         """Select the POSITION streaming submode on every motor.
 
-        Use 'pos_spd' (smooth) for slow gaits (<1 Hz) and stand/ready holds, and
-        'pos' (accurate at every frequency) for faster gaits.
+        'pos_spd' is the default for gaits and holds alike: it is
+        acceleration-shaped, and now that every setpoint carries a velocity it
+        travels at the stride's intended speed rather than the motor node's
+        minimum-speed floor. Its one limit is the protocol's acceleration cap
+        (~245 rad/s^2 at the AK40-10 output), which binds at high gait
+        frequency -- the motor nodes warn when a run outruns it. Switch to
+        'pos' for those runs: plain SET_POS tracks position accurately at any
+        frequency, giving up the acceleration shaping to do it.
         """
         for i in range(self.NUM_MOTORS):
             self.set_motor_position_mode(i, mode)
@@ -588,11 +644,16 @@ class SELQIE(Node):
             new_times, new_commands = resample_leg_trajectory(
                 raw_times[leg_id], raw_commands[leg_id], self.TRAJECTORY_RESAMPLE_HZ,
                 self.TRAJECTORY_MAX_POINTS)
+            period = leg_trajectory_period(new_times)
+            if self.TRAJECTORY_ESTIMATE_VELOCITY:
+                # The files' velocity columns are all zero; derive the real
+                # setpoint velocities so pos_spd gets a usable speed limit.
+                estimate_leg_trajectory_velocities(new_times, new_commands, period)
             leg_trajectories[leg_id].timing = new_times
             leg_trajectories[leg_id].commands = new_commands
             # Tell the publisher the true cycle duration so it can repeat the
             # stride natively, phase-exactly, without the sender republishing.
-            leg_trajectories[leg_id].period = leg_trajectory_period(new_times)
+            leg_trajectories[leg_id].period = period
         return leg_trajectories
 
     def get_leg_trajectory_period(self, trajectories : list[LegTrajectory]) -> float:

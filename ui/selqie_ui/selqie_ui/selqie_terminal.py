@@ -175,9 +175,12 @@ class SELQIETerminal(Cmd):
             print("Usage: run_trajectory <file1> <num_loops1> <frequency1> <file2> <num_loops2> <frequency2> ...")
             return
         try:
-            # Gaits run in plain position (SET_POS) for accurate tracking at any
-            # frequency; only the stand/ready hold uses the position-speed submode.
-            self._selqie.set_all_motors_position_mode('pos')
+            # Gaits run in the position-speed submode (SET_POS_SPD), which is
+            # acceleration-shaped and now gets the stride's real travel speed
+            # from the trajectory's estimated velocities. Switch to 'pos' by
+            # hand for runs fast enough to outrun the accel cap -- the motor
+            # nodes warn when that happens.
+            self._selqie.set_all_motors_position_mode('pos_spd')
             time.sleep(0.05)  # let the mode change take effect before streaming
             for seg in range(0, len(args), 3):
                 file = args[seg]

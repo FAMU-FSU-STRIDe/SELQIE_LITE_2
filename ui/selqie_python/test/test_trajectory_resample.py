@@ -328,3 +328,70 @@ def test_frequency_scaling_matches_manual_precompression():
     new_times, new_commands = sq.resample_leg_trajectory(scaled_times, commands, 200.0)
     assert new_times[-1] <= base_times[-1] / 2.0 + 1e-9
     assert len(new_times) == pytest.approx(100, abs=1)  # half the duration, same rate -> half pts
+
+
+# ------------------- setpoint velocity estimation -------------------
+
+
+def test_estimate_velocities_recovers_a_known_derivative():
+    """A sine cycle's derivative is a cosine of known amplitude."""
+    n, dt, amp = 200, 0.005, 0.1
+    times, commands = _uniform_cycle(n=n, dt=dt, amplitude=amp)
+    period = sq.leg_trajectory_period(times)
+    sq.estimate_leg_trajectory_velocities(times, commands, period)
+
+    omega = 2.0 * math.pi / period
+    for i, cmd in enumerate(commands):
+        expected = amp * omega * math.cos(omega * i * dt)
+        # Central difference is O(step^2); the rest is the sampling itself.
+        assert cmd.vel_setpoint.x == pytest.approx(expected, abs=0.02)
+        assert cmd.vel_setpoint.y == 0.0
+        assert cmd.vel_setpoint.z == 0.0   # z is constant in _uniform_cycle
+
+
+def test_estimate_velocities_wraps_at_the_cycle_seam():
+    """The first and last samples must be as smooth as the interior.
+
+    They are the seam a looping stride crosses every cycle, so a one-sided
+    difference there would drop the commanded travel speed exactly at the wrap
+    and show up as a stutter once per stride.
+    """
+    times, commands = _uniform_cycle(n=120, dt=0.01, amplitude=0.1)
+    sq.estimate_leg_trajectory_velocities(times, commands)
+    speeds = [abs(c.vel_setpoint.x) for c in commands]
+    interior_max = max(speeds[1:-1])
+    assert speeds[0] <= interior_max * 1.01
+    assert speeds[-1] <= interior_max * 1.01
+
+
+def test_estimate_velocities_leaves_a_held_pose_at_zero():
+    # A stand hold has nowhere to travel, so it must not invent a speed.
+    times = [0.0, 0.01, 0.02, 0.03]
+    commands = [_cmd(0.0, 0.0, -0.18914) for _ in times]
+    sq.estimate_leg_trajectory_velocities(times, commands)
+    assert all(c.vel_setpoint.x == 0.0 and c.vel_setpoint.z == 0.0 for c in commands)
+
+
+def test_estimate_velocities_scales_with_run_frequency():
+    """Running a cycle twice as fast must double every setpoint velocity.
+
+    This is the whole point: SET_POS_SPD's speed field is a travel limit, so if
+    it did not scale with frequency the stride could not speed up.
+    """
+    base_times, base_cmds = _uniform_cycle(n=100, dt=0.01, amplitude=0.1)
+    fast_times = [t / 2.0 for t in base_times]
+    fast_cmds = [_cmd(c.pos_setpoint.x, 0.0, -0.1) for c in base_cmds]
+
+    sq.estimate_leg_trajectory_velocities(base_times, base_cmds)
+    sq.estimate_leg_trajectory_velocities(fast_times, fast_cmds)
+
+    peak_base = max(abs(c.vel_setpoint.x) for c in base_cmds)
+    peak_fast = max(abs(c.vel_setpoint.x) for c in fast_cmds)
+    assert peak_fast == pytest.approx(2.0 * peak_base, rel=1e-6)
+
+
+def test_estimate_velocities_ignores_degenerate_input():
+    assert sq.estimate_leg_trajectory_velocities([], []) == []
+    single = [_cmd(1, 2, 3)]
+    assert sq.estimate_leg_trajectory_velocities([0.0], single) is single
+    assert single[0].vel_setpoint.x == 0.0

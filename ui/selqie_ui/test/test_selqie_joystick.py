@@ -167,7 +167,9 @@ def test_walk_with_deadman_streams_velocity(controller):
     jc._control_tick()
 
     assert fake.gaits[-1] == 'walk'
-    assert fake.pos_modes[-1] == 'pos'
+    # Moving gaits use the acceleration-shaped submode too, now that the stride
+    # generators fill in each setpoint's velocity for it to travel at.
+    assert fake.pos_modes[-1] == 'pos_spd'
     lin_x, lin_z, ang_z = fake.cmd_vels[-1]
     assert lin_x == pytest.approx(0.3)   # max_linear default, deadband(1.0)=1.0
     assert lin_z == 0.0                  # walk ignores vertical

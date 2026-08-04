@@ -71,6 +71,13 @@ Five gait nodes run continuously and publish `LegCommand` messages based on the 
 
 Gait parameters (step height, stride length, frequency, foot positions) are loaded from `leg_control_bringup/config/stride_generation.yaml`.
 
+**Setpoint velocities.** The gait models above set `pos_setpoint` only. `StrideGenerationNode` fills
+in `vel_setpoint` before publishing (`_fill_setpoint_velocity`), by central difference over the
+neighbouring stride points with periodic wrap. This is not cosmetic: `leg_kinematics` maps that
+velocity through the inverse Jacobian into per-motor rad/s, and the CubeMars node uses it as the
+`SET_POS_SPD` travel speed limit — left at zero, every gait crawls at the motor node's minimum-speed
+floor. See [Actuation](../actuation/README.md#servo-frames).
+
 ---
 
 ## Leg Trajectory Publisher

@@ -53,9 +53,11 @@ _VERTICAL_GAITS = ('swim', 'jump')   # use lin_x + lin_z
 _STATIC_GAITS = ('stand', 'sink')    # zero cmd_vel (the gait itself does the work)
 _ALL_GAITS = (_STEER_GAIT,) + _VERTICAL_GAITS + _STATIC_GAITS
 
-# Position streaming submode per gait (matches selqie_terminal): the held stand
-# pose uses the smooth position-speed submode, moving gaits use plain position.
-_POS_SPD_GAITS = ('stand',)
+# Position streaming submode per gait (matches selqie_terminal). Every gait uses
+# the acceleration-shaped position-speed submode: the stride generators now fill
+# in each setpoint's velocity, so SET_POS_SPD gets the stride's real travel speed
+# instead of falling back to the motor node's minimum-speed floor.
+_POS_SPD_GAITS = _ALL_GAITS
 
 
 class SELQIEJoystick:
